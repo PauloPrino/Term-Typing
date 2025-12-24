@@ -29,7 +29,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Google-Small"
+LLM_MODEL = "Qwen"
 
 """## 1. Load WordNet Data"""
 
@@ -222,64 +222,55 @@ elif LLM_MODEL == "Google-Large":
         outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
         return outputs
 elif LLM_MODEL == "Google-Small":
-    print("--- Mode: Google Flan-T5 Small (SAFE) ---")
-
+    print("--- Chargement de Google T5-Small (Mode Robuste) ---")
     llm_name_google = "google/flan-t5-small"
-
-    # 1️⃣ Tokenizer STANDARD (pas de padding forcé)
-    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google)
-
-    # 2️⃣ Modèle en float32 (important pour Small)
+    
+    # 1. PADDING A DROITE (Vital pour l'encodeur T5)
+    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google, padding_side="right")
+    
+    # 2. CHARGEMENT SIMPLE SUR GPU 0 (Pas de DataParallel)
+    # On force float32 pour éviter les NaN/bugs numériques
     llm_google = AutoModelForSeq2SeqLM.from_pretrained(
         llm_name_google,
-        torch_dtype=torch.float32
-    ).to(device)
-
+        torch_dtype=torch.float32 
+    ).to("cuda:0") # On force le premier GPU uniquement
+    
     llm_google.eval()
 
-    # 3️⃣ Génération courte et déterministe
     generation_config_google = GenerationConfig(
-        max_new_tokens=20,
+        max_new_tokens=20, # Suffisant pour "noun", "verb", etc.
         do_sample=False
     )
 
-    import re
+    def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
+        # 3. TOKENIZATION SECURISEE
+        # On force le padding et la troncature pour ne pas dépasser 512
+        inputs = tokenizer_model(
+            prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=512
+        ).to("cuda:0") # Doit être sur le même device que le modèle
+        
+        # 4. GENERATION EXPLICITE
+        # On passe input_ids ET attention_mask pour être sûr que le modèle ignore le padding
+        with torch.no_grad():
+            generated_ids = llm_model.generate(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=generation_cfg.max_new_tokens,
+                pad_token_id=tokenizer_model.pad_token_id,
+                eos_token_id=tokenizer_model.eos_token_id
+            )
+        
+        outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
+        
+        # 5. DEBUG (Optionnel : pour voir ce qui sort si ça plante encore)
+        # if random.random() < 0.01: # Affiche 1% des outputs pour vérifier
+        #     print(f"DEBUG Output: {outputs[0]}")
 
-    def generate_google_small_batched(prompts, llm_model, tokenizer_model, generation_cfg):
-        """
-        Version SAFE pour Flan-T5-Small :
-        - pas de padding
-        - 1 prompt à la fois (API batch-compatible)
-        - nettoyage robuste pour le parsing
-        """
-        outputs = []
-
-        for prompt in prompts:
-            inputs = tokenizer_model(
-                prompt,
-                return_tensors="pt"
-            ).to(llm_model.device)
-
-            with torch.no_grad():
-                generated_ids = llm_model.generate(
-                    inputs.input_ids,
-                    max_new_tokens=generation_cfg.max_new_tokens
-                )
-
-            text = tokenizer_model.decode(
-                generated_ids[0],
-                skip_special_tokens=True
-            ).lower()
-
-            # 🔧 NETTOYAGE CRITIQUE
-            text = re.sub(r"[^a-z]", " ", text)
-            text = " ".join(text.split())
-
-            outputs.append(text)
-
-        return outputs
-
-
+        return [o.strip("., ").lower() for o in outputs]
 
 """## Classification tasks"""
 
@@ -350,9 +341,9 @@ def run_classification(classification_task, k):
         active_llm_model = llm_google
         active_tokenizer_model = tokenizer_google
         active_generation_config = generation_config_google
-        batch_generate_func = generate_google_small_batched
-        print("LLM used: Google Flan T5 Small (SAFE)")
-
+        # On pointe directement vers la fonction batched
+        active_generate_func = generate_google_batched 
+        print("LLM used: Google Flan T5 Small")
     elif LLM_MODEL == "Qwen":
         active_llm_model = llm_qwen
         active_tokenizer_model = tokenizer_qwen
@@ -401,12 +392,10 @@ def run_classification(classification_task, k):
     # Sélectionnez la fonction batched appropriée
     if LLM_MODEL == "Qwen":
         batch_generate_func = generate_qwen_batched
-    elif LLM_MODEL == "Google-Small":
-        batch_generate_func = generate_google_small_batched
-    elif LLM_MODEL == "Google-Large":
+    else:
         batch_generate_func = generate_google_batched
 
-    BATCH_SIZE = 1 # On traite 16 phrases à la fois (8 par GPU)
+    BATCH_SIZE = 16 # On traite 16 phrases à la fois (8 par GPU)
     
     # On prépare les données
     all_indices = list(range(len(text)))
@@ -934,7 +923,7 @@ def analyze_similarity_distribution(test_sentences, test_terms, train_embeddings
     print(" - Le modèle T5-Small est très sensible au bruit : il lui faut idéalement du '> 0.70'.\n")
 
 if __name__ == "__main__":
-    for i in range(2,11):
+    for i in range(8,11):
         print(f"Running classification for k={i}...")
         run_classification("classify_term_type_with_dynamic_few_shot", k=i)
     """
