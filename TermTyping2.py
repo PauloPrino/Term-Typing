@@ -28,7 +28,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Qwen"
+LLM_MODEL = "Google"
 
 """## 1. Load WordNet Data"""
 
@@ -753,6 +753,6 @@ print("Model saved successfully to './fine_tuned_model'.")
 """
 
 if __name__ == "__main__":
-    for i in range(2,11):
+    for i in range(1,11):
         print(f"Running classification for k={i}...")
         run_classification("classify_term_type_with_dynamic_few_shot", k=i)
