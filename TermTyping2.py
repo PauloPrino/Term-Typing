@@ -24,11 +24,12 @@ import numpy as np
 from datasets import load_dataset, Dataset
 from trl import SFTTrainer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Google"
+LLM_MODEL = "Google-Small"
 
 """## 1. Load WordNet Data"""
 
@@ -171,18 +172,28 @@ if LLM_MODEL == "Qwen":
             outputs.append(content.strip())
             
         return outputs
-
-elif LLM_MODEL == "Google":
-    llm_name_google = "google/flan-t5-small"
-    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google, padding_side="left")
+elif LLM_MODEL == "Google-Large":
+    # On prend le modèle LARGE car le SMALL est trop faible pour cette tâche (comme discuté avant)
+    llm_name_google = "google/flan-t5-large" 
+    
+    # CORRECTION CRITIQUE ICI :
+    # 1. On enlève padding_side="left" (T5 préfère droite par défaut)
+    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google)
     tokenizer_google.use_default_system_prompt = False
-    tokenizer_google.pad_token_id = tokenizer_google.eos_token_id
+    
+    # 2. On NE remplace PAS le pad_token par eos_token
+    # T5 a déjà un vrai pad_token (<pad>), on le laisse faire son travail.
+    # (Supprimez la ligne tokenizer_google.pad_token_id = tokenizer_google.eos_token_id)
 
     llm_google = AutoModelForSeq2SeqLM.from_pretrained(
         llm_name_google,
         torch_dtype=torch.float16
     ).to(device)
 
+    # Note sur le DataParallel avec .generate() :
+    # DataParallel ne parallélise pas nativement la fonction .generate().
+    # Votre code actuel (llm_model.module.generate) s'exécute sur UN SEUL GPU.
+    # Pour l'instant, gardez ça pour que ça marche, mais sachez que vous n'avez pas un vrai gain x2.
     if n_gpus > 1:
         llm_google = torch.nn.DataParallel(llm_google)
         
@@ -191,18 +202,18 @@ elif LLM_MODEL == "Google":
     generation_config_google = GenerationConfig(
         max_new_tokens=128,
         do_sample=False,
+        # On utilise les tokens par défaut du tokenizer
         eos_token_id=tokenizer_google.eos_token_id,
         pad_token_id=tokenizer_google.pad_token_id,
     )
 
     def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
-        # Le tokenizer retourne déjà un dictionnaire avec 'input_ids' ET 'attention_mask'
+        # Le tokenizer va utiliser le padding par défaut (DROITE pour T5)
         inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
         
+        # On récupère le modèle de base pour le generate
         model_to_run = llm_model.module if n_gpus > 1 else llm_model
         
-        # ERREUR PRECEDENTE : Vous ne passiez que inputs.input_ids
-        # CORRECTION : On passe **inputs pour inclure l'attention_mask
         generated_ids = model_to_run.generate(
             **inputs, 
             max_new_tokens=generation_cfg.max_new_tokens
@@ -210,6 +221,65 @@ elif LLM_MODEL == "Google":
         
         outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
         return outputs
+elif LLM_MODEL == "Google-Small":
+    print("--- Mode: Google Flan-T5 Small (SAFE) ---")
+
+    llm_name_google = "google/flan-t5-small"
+
+    # 1️⃣ Tokenizer STANDARD (pas de padding forcé)
+    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google)
+
+    # 2️⃣ Modèle en float32 (important pour Small)
+    llm_google = AutoModelForSeq2SeqLM.from_pretrained(
+        llm_name_google,
+        torch_dtype=torch.float32
+    ).to(device)
+
+    llm_google.eval()
+
+    # 3️⃣ Génération courte et déterministe
+    generation_config_google = GenerationConfig(
+        max_new_tokens=20,
+        do_sample=False
+    )
+
+    import re
+
+    def generate_google_small_batched(prompts, llm_model, tokenizer_model, generation_cfg):
+        """
+        Version SAFE pour Flan-T5-Small :
+        - pas de padding
+        - 1 prompt à la fois (API batch-compatible)
+        - nettoyage robuste pour le parsing
+        """
+        outputs = []
+
+        for prompt in prompts:
+            inputs = tokenizer_model(
+                prompt,
+                return_tensors="pt"
+            ).to(llm_model.device)
+
+            with torch.no_grad():
+                generated_ids = llm_model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=generation_cfg.max_new_tokens
+                )
+
+            text = tokenizer_model.decode(
+                generated_ids[0],
+                skip_special_tokens=True
+            ).lower()
+
+            # 🔧 NETTOYAGE CRITIQUE
+            text = re.sub(r"[^a-z]", " ", text)
+            text = " ".join(text.split())
+
+            outputs.append(text)
+
+        return outputs
+
+
 
 """## Classification tasks"""
 
@@ -269,13 +339,20 @@ def classify_term_type_with_llm(term, sentence, labels, llm_model, tokenizer_mod
 # This block allows you to easily switch between Qwen and Google for evaluation
 
 def run_classification(classification_task, k):
-    if LLM_MODEL == "Google":
+    if LLM_MODEL == "Google-Large":
         active_llm_model = llm_google
         active_tokenizer_model = tokenizer_google
         active_generation_config = generation_config_google
         # On pointe directement vers la fonction batched
         active_generate_func = generate_google_batched 
-        print("LLM used: Google Flan T5 Small")
+        print("LLM used: Google Flan T5 Large")
+    if LLM_MODEL == "Google-Small":
+        active_llm_model = llm_google
+        active_tokenizer_model = tokenizer_google
+        active_generation_config = generation_config_google
+        batch_generate_func = generate_google_small_batched
+        print("LLM used: Google Flan T5 Small (SAFE)")
+
     elif LLM_MODEL == "Qwen":
         active_llm_model = llm_qwen
         active_tokenizer_model = tokenizer_qwen
@@ -324,10 +401,12 @@ def run_classification(classification_task, k):
     # Sélectionnez la fonction batched appropriée
     if LLM_MODEL == "Qwen":
         batch_generate_func = generate_qwen_batched
-    else:
+    elif LLM_MODEL == "Google-Small":
+        batch_generate_func = generate_google_small_batched
+    elif LLM_MODEL == "Google-Large":
         batch_generate_func = generate_google_batched
 
-    BATCH_SIZE = 16 # On traite 16 phrases à la fois (8 par GPU)
+    BATCH_SIZE = 1 # On traite 16 phrases à la fois (8 par GPU)
     
     # On prépare les données
     all_indices = list(range(len(text)))
@@ -752,7 +831,123 @@ trainer.save_model("./fine_tuned_model")
 print("Model saved successfully to './fine_tuned_model'.")
 """
 
+def analyze_retrieval_quality(test_sentences, test_terms, train_embeddings, embedder, k_max=10):
+    """
+    Analyse la chute de pertinence (similarité cosine) à mesure qu'on augmente k.
+    """
+    print(f"--- Analyse de la qualité du voisinage (RAG) sur {len(test_sentences)} exemples ---")
+    
+    # 1. On prépare les queries (comme dans votre code)
+    queries = []
+    for s, t in tqdm(zip(test_sentences, test_terms)):
+        queries.append(str(s) if len(str(s)) > 3 else str(t))
+    
+    # 2. Encodage des queries (Test)
+    # Note: Si trop lourd, réduire à queries[:100] pour tester
+    query_embeddings = embedder.encode(queries, convert_to_tensor=True).cpu().numpy()
+    
+    # 3. Calcul de similarité (Matrice Test x Train)
+    similarities = cosine_similarity(query_embeddings, train_embeddings)
+    
+    # 4. On récupère les scores des k_max meilleurs voisins pour chaque phrase de test
+    # On trie chaque ligne et on prend les k_max derniers (les plus grands), puis on inverse pour avoir décroissant
+    # result shape: (n_test, k_max)
+    top_k_values = np.sort(similarities, axis=1)[:, -k_max:][:, ::-1]
+    
+    # 5. Calculs statistiques
+    # Moyenne de similarité pour le voisin n°1, n°2, ..., n°k
+    avg_scores_per_rank = np.mean(top_k_values, axis=0)
+    
+    # Combien de voisins ont une similarité > 0.7 (arbitraire) en moyenne ?
+    high_quality_threshold = 0.7
+    avg_good_neighbors = np.mean(np.sum(top_k_values > high_quality_threshold, axis=1))
+
+    # --- Affichage des résultats ---
+    print(f"\nNombre moyen de voisins 'très pertinents' (sim > {high_quality_threshold}) : {avg_good_neighbors:.2f}")
+    
+    print("\nÉvolution de la similarité moyenne par rang (Rank 1 = meilleur voisin) :")
+    print(f"{'Rang':<5} | {'Sim Moyenne':<15} | {'Commentaire'}")
+    print("-" * 40)
+    
+    for i, score in enumerate(avg_scores_per_rank):
+        rank = i + 1
+        comment = ""
+        if score > 0.85: comment = "Excellent (Copie presque conforme)"
+        elif score > 0.70: comment = "Bon (Même contexte)"
+        elif score > 0.50: comment = "Moyen (Thème vague)"
+        else: comment = "Bruit (Peu de lien sémantique)"
+        
+        print(f"{rank:<5} | {score:.4f}          | {comment}")
+        
+    print(f"Average scores per rank: {avg_scores_per_rank}")
+    return avg_scores_per_rank
+
+def analyze_similarity_distribution(test_sentences, test_terms, train_embeddings, embedder, k_max=10):
+    print(f"\n{'='*20} ANALYSE APPROFONDIE DE LA DISTRIBUTION (RAG) {'='*20}")
+    
+    # 1. Encodage (limité à 500 exemples pour aller vite si besoin)
+    n_samples = min(len(test_sentences), 500)
+    print(f"Analyse sur un échantillon de {n_samples} phrases de test...")
+    
+    subset_sentences = test_sentences[:n_samples]
+    subset_terms = test_terms[:n_samples]
+    
+    queries = []
+    for s, t in zip(subset_sentences, subset_terms):
+        queries.append(str(s) if len(str(s)) > 3 else str(t))
+        
+    query_embeddings = embedder.encode(queries, convert_to_tensor=True).cpu().numpy()
+    
+    # 2. Calcul similarités
+    similarities = cosine_similarity(query_embeddings, train_embeddings)
+    
+    # 3. Récupération des top-k scores pour chaque requête
+    # Sort et prend les k derniers (les plus grands), puis flip pour avoir décroissant (1er = meilleur)
+    top_k_values = np.sort(similarities, axis=1)[:, -k_max:][:, ::-1]
+    
+    # 4. Affichage du tableau de distribution
+    print("\nDISTRIBUTION DES SCORES DE SIMILARITÉ PAR RANG DE VOISIN")
+    print("Ce tableau montre la qualité des exemples récupérés.")
+    print("-" * 105)
+    print(f"{'Rang':<5} | {'Moyenne':<7} | {'> 0.90 (Exact)':<15} | {'> 0.80 (Très Bon)':<15} | {'> 0.70 (Bon)':<15} | {'> 0.60 (Moyen)':<15} | {'< 0.60 (Bruit)':<15}")
+    print("-" * 105)
+    
+    for k in range(k_max):
+        scores_at_k = top_k_values[:, k]
+        avg = np.mean(scores_at_k)
+        
+        # Calcul des pourcentages
+        p_90 = np.mean(scores_at_k >= 0.90) * 100
+        p_80 = np.mean((scores_at_k >= 0.80) & (scores_at_k < 0.90)) * 100
+        p_70 = np.mean((scores_at_k >= 0.70) & (scores_at_k < 0.80)) * 100
+        p_60 = np.mean((scores_at_k >= 0.60) & (scores_at_k < 0.70)) * 100
+        p_low = np.mean(scores_at_k < 0.60) * 100
+        
+        # Barre visuelle simple pour le score moyen
+        bar = "#" * int(avg * 10)
+        
+        print(f"#{k+1:<4} | {avg:.3f}   | {p_90:5.1f}%          | {p_80:5.1f}%          | {p_70:5.1f}%          | {p_60:5.1f}%          | {p_low:5.1f}%")
+
+    print("-" * 105)
+    print("INTERPRÉTATION :")
+    print(" - Si la colonne '< 0.60 (Bruit)' dépasse 50% dès le rang 3, augmenter k n'ajoute que du bruit.")
+    print(" - Le modèle T5-Small est très sensible au bruit : il lui faut idéalement du '> 0.70'.\n")
+
 if __name__ == "__main__":
-    for i in range(1,11):
+    for i in range(2,11):
         print(f"Running classification for k={i}...")
         run_classification("classify_term_type_with_dynamic_few_shot", k=i)
+    """
+    # Charger l'embedder une seule fois
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    # Charger les embeddings du train (comme vous faites déjà)
+    train_id2label, train_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    print("Encoding Train...")
+    train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
+
+    # --- LANCER L'ANALYSE ---
+    # On teste sur un sous-ensemble (ex: les 200 premiers) pour que ça aille vite
+    analyze_retrieval_quality(sentences, text, train_embeddings, embedder, k_max=10)
+    analyze_similarity_distribution(sentences, text, train_embeddings, embedder, k_max=10)
+    """

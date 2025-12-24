@@ -173,16 +173,27 @@ if LLM_MODEL == "Qwen":
         return outputs
 
 elif LLM_MODEL == "Google":
-    llm_name_google = "google/flan-t5-small"
-    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google, padding_side="left")
+    # On prend le modèle LARGE car le SMALL est trop faible pour cette tâche (comme discuté avant)
+    llm_name_google = "google/flan-t5-large" 
+    
+    # CORRECTION CRITIQUE ICI :
+    # 1. On enlève padding_side="left" (T5 préfère droite par défaut)
+    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google)
     tokenizer_google.use_default_system_prompt = False
-    tokenizer_google.pad_token_id = tokenizer_google.eos_token_id
+    
+    # 2. On NE remplace PAS le pad_token par eos_token
+    # T5 a déjà un vrai pad_token (<pad>), on le laisse faire son travail.
+    # (Supprimez la ligne tokenizer_google.pad_token_id = tokenizer_google.eos_token_id)
 
     llm_google = AutoModelForSeq2SeqLM.from_pretrained(
         llm_name_google,
         torch_dtype=torch.float16
     ).to(device)
 
+    # Note sur le DataParallel avec .generate() :
+    # DataParallel ne parallélise pas nativement la fonction .generate().
+    # Votre code actuel (llm_model.module.generate) s'exécute sur UN SEUL GPU.
+    # Pour l'instant, gardez ça pour que ça marche, mais sachez que vous n'avez pas un vrai gain x2.
     if n_gpus > 1:
         llm_google = torch.nn.DataParallel(llm_google)
         
@@ -191,18 +202,18 @@ elif LLM_MODEL == "Google":
     generation_config_google = GenerationConfig(
         max_new_tokens=128,
         do_sample=False,
+        # On utilise les tokens par défaut du tokenizer
         eos_token_id=tokenizer_google.eos_token_id,
         pad_token_id=tokenizer_google.pad_token_id,
     )
 
     def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
-        # Le tokenizer retourne déjà un dictionnaire avec 'input_ids' ET 'attention_mask'
+        # Le tokenizer va utiliser le padding par défaut (DROITE pour T5)
         inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
         
+        # On récupère le modèle de base pour le generate
         model_to_run = llm_model.module if n_gpus > 1 else llm_model
         
-        # ERREUR PRECEDENTE : Vous ne passiez que inputs.input_ids
-        # CORRECTION : On passe **inputs pour inclure l'attention_mask
         generated_ids = model_to_run.generate(
             **inputs, 
             max_new_tokens=generation_cfg.max_new_tokens
