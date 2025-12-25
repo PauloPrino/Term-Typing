@@ -43,7 +43,7 @@ print(f"-----------------")
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Google-Small"
+LLM_MODEL = "Google-Large"
 
 """## 1. Load WordNet Data"""
 
@@ -222,17 +222,6 @@ elif LLM_MODEL == "Google-Small":
         with torch.no_grad():
             generated_ids = llm_model.generate(
                 inputs.input_ids,
-                max_new_tokens=generation_cfg.max_new_tokens
-            )
-        content = tokenizer_model.decode(generated_ids[0], skip_special_tokens=True)
-        return content.strip()
-    
-    def generate_google_fine_tuned(prompt, llm_model, tokenizer_model, generation_cfg):
-        inputs = tokenizer_model(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            # FIX: explicit keyword argument 'input_ids' is required for PEFT models
-            generated_ids = llm_model.generate(
-                input_ids=inputs.input_ids,
                 max_new_tokens=generation_cfg.max_new_tokens
             )
         content = tokenizer_model.decode(generated_ids[0], skip_special_tokens=True)
@@ -719,7 +708,7 @@ def evaluate_finetuned_model(model_name_key, adapter_path):
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
         base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float32).to("cuda")
         gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
-        gen_func = generate_google_fine_tuned
+        gen_func = generate_google_simple 
         
     elif model_name_key == "Qwen":
         base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
@@ -788,5 +777,5 @@ def evaluate_finetuned_model(model_name_key, adapter_path):
 if __name__ == "__main__":
     #for k in range(3,11):
     #    run_classification("classify_term_type_with_dynamic_few_shot", k)
-    #adapter_path = run_finetuning("Google-Small", output_dir="./ft_google_small")
-    evaluate_finetuned_model("Google-Small", adapter_path="./ft_google_small")
+    adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
+    evaluate_finetuned_model("Google-Large", adapter_path)

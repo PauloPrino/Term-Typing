@@ -24,11 +24,26 @@ import numpy as np
 from datasets import load_dataset, Dataset
 from trl import SFTTrainer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from sklearn.metrics.pairwise import cosine_similarity
+import gc
+from peft import PeftModel, PeftConfig
+from trl import SFTTrainer, SFTConfig
+import trl
+import sys
+
+# --- Force flush output to see logs immediately ---
+sys.stdout.reconfigure(line_buffering=True)
+
+print(f"--- DEBUG TRL ---")
+print(f"Version chargée : {trl.__version__}")
+print(f"Emplacement : {trl.__file__}")
+print(f"Python Executable : {sys.executable}")
+print(f"-----------------")
 
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Qwen"
+LLM_MODEL = "Google-Small"
 
 """## 1. Load WordNet Data"""
 
@@ -39,7 +54,6 @@ def WN_TaskA_TextClf_dataset_builder(train_test: str):
             data = json.load(file)
 
     elif train_test == "test":
-        # Pour le test, on doit charger DEUX fichiers et les fusionner
         data_file = root_path + "/WordNet/A.1(FS)_WordNet_Test.json"
         gt_file = root_path + "/WordNet/A.1(FS)_WordNet_Test_GT.json"
 
@@ -48,8 +62,6 @@ def WN_TaskA_TextClf_dataset_builder(train_test: str):
         with open(gt_file, 'r', encoding='utf-8') as f_gt:
             gt_data = json.load(f_gt)
 
-        # Créer un dictionnaire pour retrouver rapidement le type via l'ID
-        # Note: Dans le GT, le type est souvent une liste ["noun"], on prend le premier élément
         gt_lookup = {}
         for item in gt_data:
             label = item['type']
@@ -57,18 +69,14 @@ def WN_TaskA_TextClf_dataset_builder(train_test: str):
                 label = label[0]
             gt_lookup[item['ID']] = label
 
-        # Fusionner les informations (term/sentence du fichier Test + type du fichier GT)
         data = []
         for item in test_data:
-            # On ne garde que ceux qui ont une vérité terrain correspondante
             if item['ID'] in gt_lookup:
                 new_item = item.copy()
                 new_item['type'] = gt_lookup[item['ID']]
                 data.append(new_item)
 
-    # Le reste de la fonction reste identique et fonctionne maintenant pour train ET test
     types = set()
-    #de-duplicate
     for item in data:
         types.add(item["type"])
     labels = list(types)
@@ -89,10 +97,7 @@ def WN_TaskA_TextClf_dataset_builder(train_test: str):
 id2label,label2id,text,label,sentences = WN_TaskA_TextClf_dataset_builder("test")
 
 available_labels = list(id2label.values())
-#print(WN_TaskA_TextClf_dataset_builder())
 
-# --- MODIFICATION POUR 2 GPUs ---
-# On détecte si on a plusieurs GPUs
 device = "cuda" if torch.cuda.is_available() else "cpu"
 n_gpus = torch.cuda.device_count()
 print(f"Utilisation de {n_gpus} GPUs !")
@@ -104,19 +109,16 @@ if LLM_MODEL == "Qwen":
     tokenizer_qwen.use_default_system_prompt = False
     tokenizer_qwen.pad_token_id = tokenizer_qwen.eos_token_id
 
-    # 1. On charge d'abord sur le GPU principal (pas de device_map ici !)
     llm_qwen = AutoModelForCausalLM.from_pretrained(
         llm_name_qwen,
         torch_dtype=torch.float16
-    ).to(device) # On envoie vers CUDA
+    ).to(device)
 
-    # 2. Si on a plusieurs GPUs, on active le DataParallel
     if n_gpus > 1:
         llm_qwen = torch.nn.DataParallel(llm_qwen)
 
     llm_qwen.eval()
     
-    # Configuration de génération inchangée
     generation_config_qwen = GenerationConfig(
         max_new_tokens=128,
         do_sample=False,
@@ -124,31 +126,23 @@ if LLM_MODEL == "Qwen":
         pad_token_id=tokenizer_qwen.pad_token_id,
     )
 
-    # 3. Fonction de génération par BATCH (beaucoup plus rapide)
     def generate_qwen_batched(prompts, llm_model, tokenizer_model, generation_cfg):
         turns_batch = [[{"role": "user", "content": p}] for p in prompts]
-        
-        # 1. OPTIMISATION : On demande au template de nous rendre du TEXTE (str), pas des IDs.
-        # Cela nous donne le prompt formaté avec les balises système, user, etc.
         text_batch = [
             tokenizer_model.apply_chat_template(
                 turn, 
-                tokenize=False, # <--- C'est ici que ça change
+                tokenize=False,
                 add_generation_prompt=True
             ) 
             for turn in turns_batch
         ]
         
-        # 2. On passe la liste de textes bruts directement au tokenizer
-        # C'est la méthode "__call__" recommandée par le warning.
-        # Elle gère tokenization + padding + attention_mask en une seule opération optimisée en Rust/C++
         batch_inputs = tokenizer_model(
             text_batch, 
             padding=True, 
             return_tensors="pt"
         ).to(device)
 
-        # 3. Génération (Le masque d'attention est inclus automatiquement dans batch_inputs)
         if n_gpus > 1:
             generated_ids = llm_model.module.generate(
                 **batch_inputs, 
@@ -162,7 +156,6 @@ if LLM_MODEL == "Qwen":
                 pad_token_id=tokenizer_model.pad_token_id
             )
 
-        # Décodage
         outputs = []
         input_len = batch_inputs["input_ids"].shape[-1]
         for i in range(len(generated_ids)):
@@ -172,28 +165,16 @@ if LLM_MODEL == "Qwen":
             
         return outputs
 
-elif LLM_MODEL == "Google":
-    # On prend le modèle LARGE car le SMALL est trop faible pour cette tâche (comme discuté avant)
+elif LLM_MODEL == "Google-Large":
     llm_name_google = "google/flan-t5-large" 
-    
-    # CORRECTION CRITIQUE ICI :
-    # 1. On enlève padding_side="left" (T5 préfère droite par défaut)
     tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google)
     tokenizer_google.use_default_system_prompt = False
     
-    # 2. On NE remplace PAS le pad_token par eos_token
-    # T5 a déjà un vrai pad_token (<pad>), on le laisse faire son travail.
-    # (Supprimez la ligne tokenizer_google.pad_token_id = tokenizer_google.eos_token_id)
-
     llm_google = AutoModelForSeq2SeqLM.from_pretrained(
         llm_name_google,
         torch_dtype=torch.float16
     ).to(device)
 
-    # Note sur le DataParallel avec .generate() :
-    # DataParallel ne parallélise pas nativement la fonction .generate().
-    # Votre code actuel (llm_model.module.generate) s'exécute sur UN SEUL GPU.
-    # Pour l'instant, gardez ça pour que ça marche, mais sachez que vous n'avez pas un vrai gain x2.
     if n_gpus > 1:
         llm_google = torch.nn.DataParallel(llm_google)
         
@@ -202,34 +183,53 @@ elif LLM_MODEL == "Google":
     generation_config_google = GenerationConfig(
         max_new_tokens=128,
         do_sample=False,
-        # On utilise les tokens par défaut du tokenizer
         eos_token_id=tokenizer_google.eos_token_id,
         pad_token_id=tokenizer_google.pad_token_id,
     )
 
     def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
-        # Le tokenizer va utiliser le padding par défaut (DROITE pour T5)
         inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
-        
-        # On récupère le modèle de base pour le generate
         model_to_run = llm_model.module if n_gpus > 1 else llm_model
-        
         generated_ids = model_to_run.generate(
             **inputs, 
             max_new_tokens=generation_cfg.max_new_tokens
         )
-        
         outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
         return outputs
+
+elif LLM_MODEL == "Google-Small":
+    print("--- Chargement de Google T5-Small (Mode Compatible Colab) ---")
+    llm_name_google = "google/flan-t5-small"
+    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google, padding_side="left")
+    
+    tokenizer_google.use_default_system_prompt = False
+    tokenizer_google.pad_token_id = tokenizer_google.eos_token_id
+    
+    llm_google = AutoModelForSeq2SeqLM.from_pretrained(
+        llm_name_google,
+        torch_dtype=torch.float32 
+    ).to("cuda:0")
+    
+    llm_google.eval()
+
+    generation_config_google = GenerationConfig(
+        max_new_tokens=128, 
+        do_sample=False,
+    )
+
+    def generate_google_simple(prompt, llm_model, tokenizer_model, generation_cfg):
+        inputs = tokenizer_model(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            generated_ids = llm_model.generate(
+                inputs.input_ids,
+                max_new_tokens=generation_cfg.max_new_tokens
+            )
+        content = tokenizer_model.decode(generated_ids[0], skip_special_tokens=True)
+        return content.strip()
 
 """## Classification tasks"""
 
 def classify_term_type_with_llm(term, sentence, labels, llm_model, tokenizer_model, few_shot_prompting, active_generate_func, generation_cfg):
-    """
-    Classifies the type of a term within a sentence using a Causal Language Model
-    via prompt engineering.
-    """
-    # Construct the prompt to guide the LLM towards the desired classification.
     if sentence != "":
       if few_shot_prompting:
         prompt = f"""
@@ -259,202 +259,154 @@ def classify_term_type_with_llm(term, sentence, labels, llm_model, tokenizer_mod
       else:
         prompt = f"What is the type of the term: '{term}'? Choose from: {', '.join(labels)}. Answer by only giving the term type and not explaining."
 
-    # Generate a response from the model
     with torch.no_grad():
       generated_text = active_generate_func(prompt, llm_model, tokenizer_model, generation_cfg)
 
-    # Simple heuristic to extract the label from the generated text.
     generated_text_lower = generated_text.lower()
     for label_name in labels:
         if label_name in generated_text_lower:
             return label_name
 
-    # Fallback: if no direct match, try matching the first word of the generated text.
     first_word_generated = generated_text_lower.split(" ")[0]
     if first_word_generated in labels:
         return first_word_generated
 
     return "Unknown or no clear label generated"
 
-# Set the active LLM, tokenizer, generation config and generate function
-# This block allows you to easily switch between Qwen and Google for evaluation
 
 def run_classification(classification_task, k):
-    if LLM_MODEL == "Google":
+    if LLM_MODEL == "Google-Large":
         active_llm_model = llm_google
         active_tokenizer_model = tokenizer_google
         active_generation_config = generation_config_google
-        # On pointe directement vers la fonction batched
         active_generate_func = generate_google_batched 
+        print("LLM used: Google Flan T5 Large")
+    elif LLM_MODEL == "Google-Small":
+        active_llm_model = llm_google
+        active_tokenizer_model = tokenizer_google
+        active_generation_config = generation_config_google
+        active_generate_func = generate_google_simple 
         print("LLM used: Google Flan T5 Small")
     elif LLM_MODEL == "Qwen":
         active_llm_model = llm_qwen
         active_tokenizer_model = tokenizer_qwen
         active_generation_config = generation_config_qwen
-        # On pointe directement vers la fonction batched
         active_generate_func = generate_qwen_batched
         print("LLM used: Qwen3 4B Instruct")
-    # ----------------------
 
     print(f"Running predictions on Test Set for the classification task {classification_task}")
 
     if classification_task == "classify_term_type_with_rag":
-        # 2. Initialize the Embedding Model
-        # This model is small, fast, and effective for sentence similarity
         embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-        # Use external Wikipedia data (Wikitext-103)
-        # Only use this if you don't want to use the training set.
-
-        print("Loading Wikitext-103 (this may take a minute)...")
-        # Load a small subset (validation split) to keep it fast for this demo
+        print("Loading Wikitext-103...")
         wiki_data = load_dataset("wikitext", "wikitext-103-v1", split="validation")
-
-        # Extract non-empty lines to simulate a sentence store
         wikidata_sentences = [text for text in wiki_data['text'] if text.strip() and len(text.split()) > 5]
-
         print(f"RAG Knowledge Base loaded with {len(wikidata_sentences)} Wikipedia sentences.")
-        print("Encoding Wikidata sentences... (this may take a while for large datasets)")
-        # Encode all sentences in the knowledge base into vectors
+        print("Encoding Wikidata sentences...")
         wikidata_embeddings = embedder.encode(wikidata_sentences, convert_to_tensor=True).cpu().numpy()
         print("Encoding complete.")
     elif classification_task == "classify_term_type_with_dynamic_few_shot":
         embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        # CHANGEZ CETTE LIGNE : Renommez id2label en train_id2label, etc.
         train_id2label, train_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
-
         print("Encoding Train sentences for Dynamic Few-Shot...")
-
-        # On encode les phrases d'entraînement pour trouver les plus ressemblantes syntaxiquement
         train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
         print("Encoding complete.")
 
     correct_predictions = 0
     total_predictions = 0
     
-    # Sélectionnez la fonction batched appropriée
-    if LLM_MODEL == "Qwen":
-        batch_generate_func = generate_qwen_batched
-    else:
-        batch_generate_func = generate_google_batched
-
-    BATCH_SIZE = 16 # On traite 16 phrases à la fois (8 par GPU)
-    
-    # On prépare les données
-    all_indices = list(range(len(text)))
-    
-    # Barre de progression par batch
-    pbar = tqdm(total=len(text))
-    
-    for i in range(0, len(text), BATCH_SIZE):
-        batch_indices = all_indices[i : i + BATCH_SIZE]
+    if LLM_MODEL == "Google-Small":
+        print("Mode: Single Item Loop (Colab Compatible)")
+        pbar = tqdm(zip(text, sentences, label), total=len(text))
         
-        batch_terms = [text[j] for j in batch_indices]
-        batch_sentences = [sentences[j] for j in batch_indices]
-        batch_labels_idx = [label[j] for j in batch_indices]
-        
-        # ... Début de la boucle "for i in range(0, len(text), BATCH_SIZE):" ...
-
-        prompts = []
-        
-        # --- MODIFICATION START : Recherche groupée pour utiliser les 10 CPUs ---
-        batch_dynamic_examples = []
-        if classification_task == "classify_term_type_with_dynamic_few_shot":
-            # On appelle la fonction UNE FOIS pour les 16 phrases
-            # Les 10 CPUs vont travailler ensemble sur ce calcul matriciel
-            batch_dynamic_examples = get_dynamic_few_shot_examples_batched(
-                batch_sentences, batch_terms, 
-                embedder, train_embeddings, train_terms, train_labels, train_sentences, 
-                train_id2label,k
-            )
-        else:
-            batch_dynamic_examples = [""] * len(batch_terms)
-
-        # Construction des prompts (Instantané maintenant)
-        for idx, (term, sentence) in enumerate(zip(batch_terms, batch_sentences)):
-            dynamic_examples = batch_dynamic_examples[idx]
+        for test_term, test_sentence, actual_label_idx in pbar:
+            actual_label = id2label[actual_label_idx]
             
-            prompt = f"""Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}.
-            {dynamic_examples}
-            Answer by only giving the term type."""
-            prompts.append(prompt)
+            if classification_task == "classify_term_type_with_dynamic_few_shot":
+                 predicted_label = classify_term_type_with_dynamic_few_shot(
+                    test_term, test_sentence, available_labels, 
+                    active_llm_model, active_tokenizer_model, 
+                    active_generate_func, active_generation_config,
+                    embedder, train_embeddings, train_terms, train_labels, train_sentences, train_id2label, k
+                )
             
-        # ... Suite du code (Génération GPU) ...
-
-        # 2. Génération PARALLELE (C'est là que les 2 GPUs travaillent)
-        batch_responses = batch_generate_func(prompts, active_llm_model, active_tokenizer_model, active_generation_config)
-
-        # 3. Analyse des réponses
-        for response, actual_idx in zip(batch_responses, batch_labels_idx):
-            # Votre logique de parsing
-            resp_lower = response.lower()
-            pred = "unknown"
-            for lbl in available_labels:
-                if lbl in resp_lower:
-                    pred = lbl
-                    break
-            
-            actual_txt = id2label[actual_idx]
-            if pred == actual_txt:
+            if predicted_label == actual_label:
                 correct_predictions += 1
             total_predictions += 1
+
+            current_accuracy = correct_predictions / total_predictions
+            pbar.set_postfix({"Accuracy": f"{current_accuracy * 100:.2f}%"})
+
+    else:
+        print("Mode: Batched Execution")
+        if LLM_MODEL == "Qwen":
+            batch_generate_func = generate_qwen_batched
+        else:
+            batch_generate_func = generate_google_batched
             
-        pbar.update(len(batch_indices))
-        current_acc = correct_predictions / total_predictions
-        pbar.set_postfix({"Accuracy": f"{current_acc * 100:.2f}%"})
+        BATCH_SIZE = 16
+        all_indices = list(range(len(text)))
+        pbar = tqdm(total=len(text))
+
+        for i in range(0, len(text), BATCH_SIZE):
+            batch_indices = all_indices[i : i + BATCH_SIZE]
+            batch_terms = [text[j] for j in batch_indices]
+            batch_sentences = [sentences[j] for j in batch_indices]
+            batch_labels_idx = [label[j] for j in batch_indices]
+
+            if classification_task == "classify_term_type_with_dynamic_few_shot":
+                 batch_dynamic_examples = get_dynamic_few_shot_examples_batched(
+                    batch_sentences, batch_terms, 
+                    embedder, train_embeddings, train_terms, train_labels, train_sentences, 
+                    train_id2label, k
+                )
+            else:
+                 batch_dynamic_examples = [""] * len(batch_terms)
+
+            prompts = []
+            for idx, (term, sentence) in enumerate(zip(batch_terms, batch_sentences)):
+                dynamic_examples = batch_dynamic_examples[idx]
+                prompt = f"""Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}.\n{dynamic_examples}\nAnswer by only giving the term type."""
+                prompts.append(prompt)
+            
+            batch_responses = batch_generate_func(prompts, active_llm_model, active_tokenizer_model, active_generation_config)
+            
+            for response, actual_idx in zip(batch_responses, batch_labels_idx):
+                resp_lower = response.lower()
+                pred = "unknown"
+                for lbl in available_labels:
+                    if lbl in resp_lower:
+                        pred = lbl
+                        break
+                if pred == id2label[actual_idx]:
+                    correct_predictions += 1
+                total_predictions += 1
+            
+            pbar.update(len(batch_indices))
+            current_acc = correct_predictions / total_predictions
+            pbar.set_postfix({"Accuracy": f"{current_acc * 100:.2f}%"})
 
     accuracy = correct_predictions / total_predictions
     print(f"\nFinal Accuracy for the classification task {classification_task} and k={k}: {accuracy * 100:.2f}%")
 
-"""## Chain of Thought
-
-## RAG
-
-In the case where we don't have a sentence but just the term we search for occurences of this term in the dataset directly (not with the embedding, not with similarity) and we take as a sentence an occurence of it with the previous words and newt words with which it appears with a certain probability distribution deciding how many terms before and after we have and also how many sentences we take/build.
-
-## RAG on Wikipedia
-"""
+"""## RAG"""
 
 def get_rag_context(query_sentence, embedder, wikidata_embeddings, wikidata_sentences, k):
-    """
-    Retrieves the top-k most similar sentences from the wikidata_sentences
-    based on the query_sentence.
-    """
     if not query_sentence:
         return ""
-
-    # Embed the query sentence
     query_embedding = embedder.encode([query_sentence], convert_to_tensor=True).cpu().numpy()
-
-    # Calculate cosine similarity between query and all wikidata sentences
-    # valid range: [-1, 1], higher is more similar
     similarities = cosine_similarity(query_embedding, wikidata_embeddings)
-
-    # Get the indices of the top-k most similar sentences
-    # argsort sorts in ascending order, so we take the last k elements and reverse them
     top_k_indices = similarities[0].argsort()[-k:][::-1]
-
-    # Retrieve the actual sentences
     retrieved_contexts = [wikidata_sentences[idx] for idx in top_k_indices]
-
-    # Join them if k > 1
     return " ".join(retrieved_contexts)
 
 def classify_term_type_with_rag(term, sentence, labels, llm_model, tokenizer_model, few_shot_prompting, active_generate_func, generation_cfg, embedder, wikidata_embeddings, wikidata_sentences, k):
-    """
-    Classifies term type using RAG to inject similar context.
-    """
-    # 1. Retrieve Context
-    # We find a sentence in our knowledge base that is semantically similar to the input
     retrieved_context = get_rag_context(sentence, embedder, wikidata_embeddings, wikidata_sentences,k)
 
     context_block = ""
     if retrieved_context:
         context_block = f"Here are other similar sentences to help you: {retrieved_context}\n"
-        #print(context_block)
 
-    # 2. Construct Prompt with RAG
-    # We provide the retrieved sentence as a reference "Context" or "Similar usage"
     if sentence != "":
       if few_shot_prompting:
         prompt = f"""
@@ -486,17 +438,14 @@ def classify_term_type_with_rag(term, sentence, labels, llm_model, tokenizer_mod
       else:
         prompt = f"What is the type of the term: '{term}'? Choose from: {', '.join(labels)}. {context_block}Answer by only giving the term type and not explaining."
 
-    # 3. Generate
     with torch.no_grad():
       generated_text = active_generate_func(prompt, llm_model, tokenizer_model, generation_cfg)
 
-    # Simple heuristic to extract the label from the generated text.
     generated_text_lower = generated_text.lower()
     for label_name in labels:
         if label_name in generated_text_lower:
             return label_name
 
-    # Fallback: if no direct match, try matching the first word of the generated text.
     first_word_generated = generated_text_lower.split(" ")[0]
     if first_word_generated in labels:
         return first_word_generated
@@ -506,49 +455,31 @@ def classify_term_type_with_rag(term, sentence, labels, llm_model, tokenizer_mod
 """## RAG on the Train set"""
 
 def get_dynamic_few_shot_examples(query_sentence, query_term, embedder, train_embeddings, train_terms, train_labels, train_sentences, id2label, k):
-    """
-    Récupère 3 exemples du Train Set.
-    Si la phrase est vide, on utilise le TERME pour trouver des phrases
-    qui parlent de ce concept dans le train set.
-    """
-    # Si la phrase est vide ou trop courte, on utilise le terme comme requête
     search_query = query_sentence if len(str(query_sentence)) > 3 else query_term
 
     if not search_query:
         return ""
 
     query_embedding = embedder.encode([str(search_query)], convert_to_tensor=True).cpu().numpy()
-
-    # Calcul de similarité
     similarities = cosine_similarity(query_embedding, train_embeddings)
-
-    # Top K
     top_k_indices = similarities[0].argsort()[-k:][::-1]
 
     examples_text = ""
     for idx in top_k_indices:
         ex_term = train_terms[idx]
         ex_sent = train_sentences[idx]
-        # Gestion propre des labels (ids ou strings)
         raw_label = train_labels[idx]
         ex_label = id2label[raw_label] if isinstance(raw_label, int) else raw_label
 
-        # On ne garde l'exemple que s'il a du sens (évite de récupérer des exemples vides)
         if len(str(ex_sent)) > 3:
             examples_text += f"- term: {ex_term}, sentence: {ex_sent}, answer: {ex_label}\n"
 
-    # Si on a rien trouvé de pertinent (ex: que des phrases vides), on met un fallback
     if not examples_text:
          examples_text = "- term: apple, sentence: I ate an apple, answer: noun\n"
 
     return examples_text
 
 def get_dynamic_few_shot_examples_batched(batch_sentences, batch_terms, embedder, train_embeddings, train_terms, train_labels, train_sentences, id2label, k):
-    """
-    Version optimisée CPU : Utilise les 10 cœurs pour calculer la similarité 
-    sur tout le batch d'un coup (Vectorisation).
-    """
-    # 1. Préparation des requêtes pour tout le batch
     queries = []
     for s, t in zip(batch_sentences, batch_terms):
         queries.append(str(s) if len(str(s)) > 3 else str(t))
@@ -556,17 +487,10 @@ def get_dynamic_few_shot_examples_batched(batch_sentences, batch_terms, embedder
     if not queries:
         return [""] * len(batch_sentences)
 
-    # 2. Encodage VECTORIEL (Rapide)
-    # Numpy va utiliser vos 10 CPUs ici pour les opérations matricielles
     query_embeddings = embedder.encode(queries, convert_to_tensor=True).cpu().numpy()
-
-    # 3. Calcul de similarité GÉANT
-    # C'est ICI que le gain x10 se fait : une seule grosse multiplication matricielle
     similarities = cosine_similarity(query_embeddings, train_embeddings)
-
     batch_examples_text = []
     
-    # 4. Extraction des résultats
     for i in range(len(queries)):
         top_k_indices = similarities[i].argsort()[-k:][::-1]
         
@@ -575,7 +499,6 @@ def get_dynamic_few_shot_examples_batched(batch_sentences, batch_terms, embedder
             ex_term = train_terms[idx]
             ex_sent = train_sentences[idx]
             raw_label = train_labels[idx]
-            # Gestion int/str pour le label
             ex_label = id2label[raw_label] if isinstance(raw_label, int) else raw_label
             
             if len(str(ex_sent)) > 3:
@@ -589,11 +512,8 @@ def get_dynamic_few_shot_examples_batched(batch_sentences, batch_terms, embedder
     return batch_examples_text
 
 def classify_term_type_with_dynamic_few_shot(term, sentence, labels, llm_model, tokenizer_model, active_generate_func, generation_cfg, embedder, train_embeddings, train_terms, train_labels, train_sentences, id2label, k):
-
-    # 1. Récupération intelligente (on passe aussi le terme)
     dynamic_examples = get_dynamic_few_shot_examples(sentence, term, embedder, train_embeddings, train_terms, train_labels, train_sentences, id2label, k)
 
-    # 2. Construction du prompt
     prompt = f"""
 Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose the term type from: {', '.join(labels)}.
 
@@ -602,19 +522,13 @@ Here are some examples of similar cases to help you:
 
 Answer by only giving the term type and not explaining.
 """
-
-    # 3. Génération via la fonction WRAPPER
     generated_text = active_generate_func(prompt, llm_model, tokenizer_model, generation_cfg)
 
-    # 4. Parsing (inchangé)
     generated_text_lower = generated_text.lower()
-
-    # Recherche exacte
     for label_name in labels:
         if label_name in generated_text_lower:
             return label_name
 
-    # Recherche premier mot (nettoyé de la ponctuation)
     first_word = generated_text_lower.split()[0].strip(".,!:")
     if first_word in labels:
         return first_word
@@ -623,147 +537,243 @@ Answer by only giving the term type and not explaining.
 
 """## Fine tuning"""
 
-"""## Error analysis
-Study the errors made by the LLMs (is it more on when there are no sentences and they just give you the sentence)
+def format_dataset_for_training(terms, sentences, labels_ids, id2label, tokenizer, model_type):
+    available_labels = list(id2label.values())
+    formatted_data = []
 
-# Task
-Fine-tune the `google/flan-t5-small` model using QLoRA with the WordNet dataset for term type classification.
+    for i in range(len(terms)):
+        term = terms[i]
+        sentence = sentences[i]
+        label_text = id2label[labels_ids[i]]
 
-## Install necessary libraries
+        if sentence and len(str(sentence)) > 3:
+            prompt = f"Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
+        else:
+            prompt = f"What is the type of the term: '{term}'? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
 
-### Subtask:
-Install the `peft` and `trl` libraries required for QLoRA fine-tuning.
+        if model_type == "seq2seq": # T5
+            text = f"{prompt} {label_text}"
+        else: # CausalLM (Qwen)
+            text = f"User: {prompt}\nAssistant: {label_text}<|endoftext|>"
 
-**Reasoning**:
-Install the required libraries `peft` and `trl` using `pip install`.
-"""
+        formatted_data.append({"text": text})
 
-"""## Load and prepare training data
+    return Dataset.from_list(formatted_data)
 
-### Subtask:
-Load the WordNet training dataset and format it into prompt-completion pairs suitable for SFTTrainer.
-
-**Reasoning**:
-The subtask requires loading the WordNet training data and formatting it into prompt-completion pairs suitable for SFTTrainer. The first step is to load the training data using the provided `WN_TaskA_TextClf_dataset_builder` function.
-"""
-
-"""
-# 1. Load the WordNet training data
-id2label, label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
-
-# 2. Create a list of available labels
-available_labels = list(id2label.values())
-
-# 3. Initialize an empty list for formatted training data
-formatted_training_data = []
-
-# 4. Iterate through the training examples
-for i in range(len(train_terms)):
-    term = train_terms[i]
-    sentence = train_sentences[i]
-    actual_label_id = train_labels[i]
-    actual_label_text = id2label[actual_label_id]
-
-    # 5. Construct the prompt string based on sentence availability
-    if sentence != "":
-        prompt = f"Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose the term type from: {', '.join(available_labels)}. Answer by only giving the term type and not explaining."
+def run_finetuning(model_name_key, output_dir="./finetuned_model"):
+    print(f"--- Démarrage du Fine-Tuning pour : {model_name_key} ---")
+    
+    train_id2label, train_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    
+    if model_name_key == "Google-Small":
+        model_id = "google/flan-t5-small"
+        model_type = "seq2seq"
+        target_modules = ["q", "v"] 
+        bnb_config = None 
+    elif model_name_key == "Google-Large":
+        model_id = "google/flan-t5-large"
+        model_type = "seq2seq"
+        target_modules = ["q", "v"]
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    elif model_name_key == "Qwen":
+        model_id = "Qwen/Qwen3-4B-Instruct-2507"
+        model_type = "causal"
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        
+        # --- FIX P100: Compute Dtype Float16 (Safe) ---
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16, 
+            bnb_4bit_use_double_quant=False,
+        )
     else:
-        prompt = f"What is the type of the term: '{term}'? Choose from: {', '.join(available_labels)}. Answer by only giving the term type and not explaining."
+        raise ValueError("Modèle inconnu.")
 
-    # 7. Concatenate prompt with the actual label text
-    full_training_example_string = f"{prompt} {actual_label_text}"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    
+    if model_type == "seq2seq":
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, torch_dtype=torch.float32, device_map="cuda")
+    else:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+        # --- FIX: Initial Load in Float16 ---
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            quantization_config=bnb_config, 
+            device_map="auto",
+            torch_dtype=torch.float16 
+        )
+        
+        # --- FIX: Overwrite Internal Config Metadata ---
+        # Stop accelerate/PEFT from assuming BF16 because the JSON says so.
+        model.config.torch_dtype = torch.float16 
+        model.config.use_cache = False
 
-    # 8. Append to the formatted_training_data list
-    formatted_training_data.append({'text': full_training_example_string})
+    train_dataset = format_dataset_for_training(
+        train_terms, train_sentences, train_labels, train_id2label, tokenizer, model_type
+    )
 
-# 9. Convert the formatted_training_data list into a Dataset object
-train_dataset = Dataset.from_list(formatted_training_data)
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=target_modules,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="SEQ_2_SEQ_LM" if model_type == "seq2seq" else "CAUSAL_LM"
+    )
+    
+    if bnb_config:
+        model = prepare_model_for_kbit_training(model)
+    
+    model = get_peft_model(model, peft_config)
+    
+    # --- FIX ULTIME: BRUTE FORCE FLOAT32 CONVERSION ---
+    # Sur P100, on ne peut ABSOLUMENT PAS avoir de BF16.
+    # Les paramètres "trainable" (LoRA) sont ceux qui posent problème dans l'optimizer.
+    # On les force en float32 (Standard QLoRA = 4bit Base + Float32 Adapters).
+    print(">>> [Sécurité P100] Vérification et conversion FORCEE des paramètres...")
+    
+    count_converted = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # Si c'est un adapter ou une norme trainable
+            # On force le float32 pour la stabilité numérique et éviter le crash BF16
+            if param.dtype != torch.float32:
+                print(f" -> Conversion {name} de {param.dtype} vers float32")
+                param.data = param.data.to(torch.float32)
+                count_converted += 1
+                
+    print(f">>> {count_converted} paramètres critiques convertis en float32.")
 
-print(f"Created training dataset with {len(train_dataset)} examples.")
-print(f"First example: {train_dataset[0]['text']}")
+    model.print_trainable_parameters()
 
-"""## Configure QLoRA
+    from trl import __version__ as trl_version
+    from packaging import version
+    
+    # --- Training Args: STRICT FP16 (Classic AMP) ---
+    sft_config_kwargs = {
+        "output_dir": f"{output_dir}_checkpoints",
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 4,
+        "learning_rate": 2e-4,
+        "logging_steps": 10,
+        "num_train_epochs": 1,
+        "save_strategy": "epoch",
+        "fp16": False,   # Active le scaler FP16 classique (supporté par P100)
+        "bf16": False,  # DESACTIVE le mode BF16 (Crash assuré sur P100)
+        "report_to": "none",
+    }
+    
+    training_args = SFTConfig(**sft_config_kwargs)
 
-"""
-# 1. Prepare the model for k-bit training
-llm_google.gradient_checkpointing_enable()
-lora_model = prepare_model_for_kbit_training(llm_google)
+    trainer_kwargs = {
+        "model": model,
+        "train_dataset": train_dataset,
+        "args": training_args,
+    }
 
-# 2. Define the LoRA configuration
-# Inspect the model architecture to find appropriate target_modules
-# For Flan-T5, common target modules include 'q', 'k', 'v' for attention layers and 'wi_0', 'wi_1' for feed-forward networks.
-# Let's start with 'q', 'v' as suggested and common for T5 attention.
-target_modules = ["q", "v"]
+    current_ver = version.parse(trl_version)
+    if current_ver >= version.parse("0.25.0"):
+        print(f"Détection TRL Récent ({trl_version})")
+        training_args.dataset_text_field = "text"
+        training_args.max_seq_length = 256
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        print(f"Détection TRL Ancien ({trl_version})")
+        trainer_kwargs["tokenizer"] = tokenizer
+        trainer_kwargs["dataset_text_field"] = "text"
+        trainer_kwargs["max_seq_length"] = 256
 
-lora_config = LoraConfig(
-    r=32,
-    lora_alpha=64,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="SEQ_2_SEQ_LM",
-    target_modules=target_modules
-)
+    trainer = SFTTrainer(**trainer_kwargs)
 
-# 3. Apply the LoRA configuration to the model
-lora_model = get_peft_model(lora_model, lora_config)
+    trainer.train()
+    
+    print(f"Sauvegarde de l'adaptateur dans {output_dir}...")
+    trainer.model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    del model
+    del trainer
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return output_dir
 
-# Print trainable parameters
-lora_model.print_trainable_parameters()
+def evaluate_finetuned_model(model_name_key, adapter_path):
+    print(f"--- Chargement du modèle Fine-Tuné ({model_name_key}) pour évaluation ---")
+    
+    if model_name_key == "Google-Small":
+        base_model_id = "google/flan-t5-small"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float32).to("cuda")
+        gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
+        gen_func = generate_google_simple 
+        
+    elif model_name_key == "Qwen":
+        base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        
+        # Load in float16 to match what we did in training context
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id, 
+            torch_dtype=torch.float16, 
+            device_map="auto"
+        )
+        gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
+        gen_func = generate_qwen_batched
+        
+    else: 
+        base_model_id = "google/flan-t5-large"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16, device_map="auto")
+        gen_config = GenerationConfig(max_new_tokens=64)
+        gen_func = generate_google_batched
 
-print("QLoRA configuration applied successfully to llm_google.")
+    print(f"Chargement des poids LoRA depuis {adapter_path}...")
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+    model.eval()
 
-"""
+    print("Lancement de la boucle de prédiction...")
+    
+    available_labels = list(id2label.values())
+    correct_predictions = 0
+    total_predictions = 0
+    
+    pbar = tqdm(zip(text, sentences, label), total=len(text))
+    
+    for test_term, test_sentence, actual_label_idx in pbar:
+        actual_label = id2label[actual_label_idx]
+        
+        if test_sentence and len(str(test_sentence)) > 3:
+            prompt = f"Given the term '{test_term}' in the sentence '{test_sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
+        else:
+            prompt = f"What is the type of the term: '{test_term}'? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
 
-"""
-# 1. Define output directory
-output_dir = "./results"
+        with torch.no_grad():
+            if "batched" in gen_func.__name__:
+                 res = gen_func([prompt], model, tokenizer, gen_config)
+            else:
+                 res = gen_func(prompt, model, tokenizer, gen_config)
+            
+            generated_text = res[0] if isinstance(res, list) else res
 
-# 2. Instantiate TrainingArguments with num_train_epochs set to 1
-training_arguments = TrainingArguments(
-    output_dir=output_dir,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=2,
-    learning_rate=2e-4,
-    num_train_epochs=1, # Modified to 1 epoch
-    logging_steps=50,
-    save_steps=200,
-    optim="paged_adamw_8bit",
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.03,
-    bf16=True,
-    report_to="none",
-    remove_unused_columns=False
-)
+        generated_text_lower = generated_text.lower()
+        predicted = "unknown"
+        
+        for lbl in available_labels:
+            if lbl in generated_text_lower:
+                predicted = lbl
+                break
+        
+        if predicted == actual_label:
+            correct_predictions += 1
+        total_predictions += 1
+        
+        pbar.set_postfix({"Acc": f"{correct_predictions/total_predictions*100:.2f}%"})
 
-print("TrainingArguments updated successfully with num_train_epochs=1.")
-
-# Instantiate SFTTrainer with updated training_arguments
-trainer = SFTTrainer(
-    model=lora_model,
-    train_dataset=train_dataset,
-    args=training_arguments
-)
-
-print("SFTTrainer re-instantiated successfully with updated training arguments.")
-
-print("Starting fine-tuning...")
-trainer.train()
-print("Fine-tuning completed. Saving model...")
-
-# Save the fine-tuned model
-trainer.save_model("./fine_tuned_model")
-print("Model saved successfully to './fine_tuned_model'.")
-
-print("Starting fine-tuning...")
-trainer.train()
-print("Fine-tuning completed. Saving model...")
-
-# Save the fine-tuned model
-trainer.save_model("./fine_tuned_model")
-print("Model saved successfully to './fine_tuned_model'.")
-"""
+    print(f"Final Accuracy (Fine-Tuned): {correct_predictions/total_predictions*100:.2f}%")
 
 if __name__ == "__main__":
-    for i in range(2,11):
-        print(f"Running classification for k={i}...")
-        run_classification("classify_term_type_with_dynamic_few_shot", k=i)
+    adapter_path = run_finetuning("Qwen", output_dir="./ft_qwen")
+    evaluate_finetuned_model("Qwen", adapter_path)
