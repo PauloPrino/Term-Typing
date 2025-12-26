@@ -43,7 +43,7 @@ print(f"-----------------")
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Qwen"
+LLM_MODEL = "Google-Base"
 
 """## 1. Load WordNet Data"""
 
@@ -647,7 +647,9 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
         model_id = "google/flan-t5-large"
         is_seq2seq = True
         target_modules = ["q", "v"]
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        # FIX: Disable quantization (None). 
+        # The model is small enough to run in full precision/float16 on P100.
+        bnb_config = None
     elif model_name_key == "Qwen":
         model_id = "Qwen/Qwen3-4B-Instruct-2507"
         is_seq2seq = False
@@ -813,12 +815,20 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3):
         gen_func = generate_qwen_batched
         
     elif model_name_key == "Google-Large":
-        model_id = "google/flan-t5-large"
-        is_seq2seq = True
-        target_modules = ["q", "v"]
-        # FIX : On désactive la quantification (None).
-        # Le modèle est assez petit pour tenir en mémoire nativement sur un P100.
-        bnb_config = None
+        base_model_id = "google/flan-t5-large"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        
+        # CORRECTION : On instancie réellement le modèle ici.
+        # Pas de quantization (bitsandbytes) car on a vu que ça plantait sur P100.
+        # On utilise float16 qui passe largement sur les 16Go de VRAM.
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(
+            base_model_id, 
+            torch_dtype=torch.float16, 
+            device_map="auto"
+        )
+        
+        gen_config = GenerationConfig(max_new_tokens=64)
+        gen_func = generate_google_batched
 
     print(f"Chargement des poids LoRA depuis {adapter_path}...")
     model = PeftModel.from_pretrained(base_model, adapter_path)
@@ -905,8 +915,8 @@ if __name__ == "__main__":
     #    run_classification("classify_term_type_with_dynamic_few_shot", k)
     #for k in range(1,11):
     #    run_classification("classify_term_type_with_rag", k)
-    #adapter_path = run_finetuning("Google-Small", output_dir="./ft_google_small")
-    #evaluate_finetuned_model("Google-Small", "./ft_google_small", use_rag=False, k=0)
+    #adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
+    #evaluate_finetuned_model("Google-Large", "./ft_google_large", use_rag=False, k=0)
     for i in range(1,11):
-        evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i)
+        evaluate_finetuned_model("Google-Base", "./ft_google_base", use_rag=True, k=i)
     #run_classification("classify_term_type_with_llm", k=0)

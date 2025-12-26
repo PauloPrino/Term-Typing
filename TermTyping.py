@@ -43,7 +43,7 @@ print(f"-----------------")
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Google-Small"
+LLM_MODEL = "Google-Large"
 
 """## 1. Load WordNet Data"""
 
@@ -143,18 +143,17 @@ if LLM_MODEL == "Qwen":
             return_tensors="pt"
         ).to(device)
 
-        if n_gpus > 1:
-            generated_ids = llm_model.module.generate(
-                **batch_inputs, 
-                max_new_tokens=generation_cfg.max_new_tokens,
-                pad_token_id=tokenizer_model.pad_token_id
-            )
+        # FIX: Check if 'module' exists (DataParallel) or use model directly (PeftModel/Single GPU)
+        if hasattr(llm_model, "module"):
+            model_to_run = llm_model.module
         else:
-            generated_ids = llm_model.generate(
-                **batch_inputs,
-                max_new_tokens=generation_cfg.max_new_tokens,
-                pad_token_id=tokenizer_model.pad_token_id
-            )
+            model_to_run = llm_model
+
+        generated_ids = model_to_run.generate(
+            **batch_inputs, 
+            max_new_tokens=generation_cfg.max_new_tokens,
+            pad_token_id=tokenizer_model.pad_token_id
+        )
 
         outputs = []
         input_len = batch_inputs["input_ids"].shape[-1]
@@ -189,14 +188,20 @@ elif LLM_MODEL == "Google-Large":
 
     def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
         inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
-        model_to_run = llm_model.module if n_gpus > 1 else llm_model
+        
+        # FIX: Check if 'module' attribute actually exists (DataParallel) before accessing it
+        # This handles both DataParallel (Training) and standard PeftModel (Evaluation)
+        if hasattr(llm_model, "module"):
+            model_to_run = llm_model.module
+        else:
+            model_to_run = llm_model
+
         generated_ids = model_to_run.generate(
             **inputs, 
             max_new_tokens=generation_cfg.max_new_tokens
         )
         outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
         return outputs
-
 elif LLM_MODEL == "Google-Small":
     print("--- Chargement de Google T5-Small (Mode Compatible Colab) ---")
     llm_name_google = "google/flan-t5-small"
@@ -208,7 +213,7 @@ elif LLM_MODEL == "Google-Small":
     llm_google = AutoModelForSeq2SeqLM.from_pretrained(
         llm_name_google,
         torch_dtype=torch.float32 
-    ).to("cuda:0")
+    ).to(device)
     
     llm_google.eval()
 
@@ -220,12 +225,51 @@ elif LLM_MODEL == "Google-Small":
     def generate_google_simple(prompt, llm_model, tokenizer_model, generation_cfg):
         inputs = tokenizer_model(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
+            # CORRECTION : input_ids doit être passé en argument nommé
             generated_ids = llm_model.generate(
-                inputs.input_ids,
+                input_ids=inputs.input_ids,
                 max_new_tokens=generation_cfg.max_new_tokens
             )
         content = tokenizer_model.decode(generated_ids[0], skip_special_tokens=True)
         return content.strip()
+elif LLM_MODEL == "Google-Base":
+    llm_name_google = "google/flan-t5-base"
+    tokenizer_google = AutoTokenizer.from_pretrained(llm_name_google)
+    tokenizer_google.use_default_system_prompt = False
+
+    llm_google = AutoModelForSeq2SeqLM.from_pretrained(
+        llm_name_google,
+        torch_dtype=torch.float16
+    ).to(device)
+
+    if n_gpus > 1:
+        llm_google = torch.nn.DataParallel(llm_google)
+
+    llm_google.eval()
+
+    generation_config_google = GenerationConfig(
+        max_new_tokens=128,
+        do_sample=False,
+        eos_token_id=tokenizer_google.eos_token_id,
+        pad_token_id=tokenizer_google.pad_token_id,
+    )
+
+    # À remplacer dans la section elif LLM_MODEL == "Google-Base":
+    def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
+        inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
+        
+        # CORRECTION : Vérifier si l'attribut 'module' existe vraiment
+        if hasattr(llm_model, "module"):
+            model_to_run = llm_model.module
+        else:
+            model_to_run = llm_model
+
+        generated_ids = model_to_run.generate(
+            **inputs,
+            max_new_tokens=generation_cfg.max_new_tokens
+        )
+        outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
+        return outputs
 
 """## Classification tasks"""
 
@@ -293,6 +337,12 @@ def run_classification(classification_task, k):
         active_generation_config = generation_config_qwen
         active_generate_func = generate_qwen_batched
         print("LLM used: Qwen3 4B Instruct")
+    elif LLM_MODEL == "Google-Base":
+        active_llm_model = llm_google
+        active_tokenizer_model = tokenizer_google
+        active_generation_config = generation_config_google
+        active_generate_func = generate_google_batched
+        print("LLM used: Google Flan T5 Base")
 
     print(f"Running predictions on Test Set for the classification task {classification_task}")
 
@@ -335,7 +385,7 @@ def run_classification(classification_task, k):
             total_predictions += 1
 
             current_accuracy = correct_predictions / total_predictions
-            pbar.set_postfix({"Accuracy": f"{current_accuracy * 100:.2f}%"})
+            pbar.set_postfix({f"Accuracy k={k}": f"{current_accuracy * 100:.2f}%"})
 
     else:
         print("Mode: Batched Execution")
@@ -537,50 +587,73 @@ Answer by only giving the term type and not explaining.
 
 """## Fine tuning"""
 
+from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments
+
 def format_dataset_for_training(terms, sentences, labels_ids, id2label, tokenizer, model_type):
     available_labels = list(id2label.values())
-    formatted_data = []
+    
+    # Liste pour stocker les données
+    dataset_data = []
 
     for i in range(len(terms)):
         term = terms[i]
         sentence = sentences[i]
         label_text = id2label[labels_ids[i]]
 
+        # Création du Prompt (Input)
         if sentence and len(str(sentence)) > 3:
             prompt = f"Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
         else:
             prompt = f"What is the type of the term: '{term}'? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
 
-        if model_type == "seq2seq": # T5
-            text = f"{prompt} {label_text}"
-        else: # CausalLM (Qwen)
+        if model_type == "seq2seq": # POUR T5
+            # On tokenise directement ici pour T5
+            # L'input est le prompt, la cible (label) est le label_text
+            model_input = tokenizer(prompt, max_length=256, truncation=True)
+            labels = tokenizer(label_text, max_length=32, truncation=True)
+            
+            dataset_data.append({
+                "input_ids": model_input["input_ids"],
+                "attention_mask": model_input["attention_mask"],
+                "labels": labels["input_ids"] # T5 calcule la perte par rapport à ça
+            })
+            
+        else: # POUR QWEN (Causal)
+            # On garde le format texte simple, le SFTTrainer s'occupe du reste
             text = f"User: {prompt}\nAssistant: {label_text}<|endoftext|>"
+            dataset_data.append({"text": text})
 
-        formatted_data.append({"text": text})
-
-    return Dataset.from_list(formatted_data)
+    return Dataset.from_list(dataset_data)
 
 def run_finetuning(model_name_key, output_dir="./finetuned_model"):
     print(f"--- Démarrage du Fine-Tuning pour : {model_name_key} ---")
     
+    # Récupération des données Train
     train_id2label, train_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    
+    # Configuration du modèle
+    bnb_config = None
+    is_seq2seq = False
     
     if model_name_key == "Google-Small":
         model_id = "google/flan-t5-small"
-        model_type = "seq2seq"
+        is_seq2seq = True
         target_modules = ["q", "v"] 
-        bnb_config = None 
+    elif model_name_key == "Google-Base":
+        model_id = "google/flan-t5-base"
+        is_seq2seq = True
+        target_modules = ["q", "v"]
     elif model_name_key == "Google-Large":
         model_id = "google/flan-t5-large"
-        model_type = "seq2seq"
+        is_seq2seq = True
         target_modules = ["q", "v"]
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        # FIX: Disable quantization (None). 
+        # The model is small enough to run in full precision/float16 on P100.
+        bnb_config = None
     elif model_name_key == "Qwen":
         model_id = "Qwen/Qwen3-4B-Instruct-2507"
-        model_type = "causal"
+        is_seq2seq = False
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        
-        # --- FIX P100: Compute Dtype Float16 (Safe) ---
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -592,107 +665,119 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
-    if model_type == "seq2seq":
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, torch_dtype=torch.float32, device_map="cuda")
+    # Chargement du modèle
+    if is_seq2seq:
+        model_type_str = "seq2seq"
+        # T5
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_id, 
+            quantization_config=bnb_config, # Supporte 8bit si activé pour Large
+            device_map="auto",
+            torch_dtype=torch.float32 if not bnb_config else torch.float16
+        )
     else:
+        model_type_str = "causal"
+        # Qwen
         tokenizer.pad_token = tokenizer.eos_token
-        
-        # --- FIX: Initial Load in Float16 ---
         model = AutoModelForCausalLM.from_pretrained(
             model_id, 
             quantization_config=bnb_config, 
             device_map="auto",
             torch_dtype=torch.float16 
         )
-        
-        # --- FIX: Overwrite Internal Config Metadata ---
-        # Stop accelerate/PEFT from assuming BF16 because the JSON says so.
-        model.config.torch_dtype = torch.float16 
         model.config.use_cache = False
 
+    # Préparation du Dataset
     train_dataset = format_dataset_for_training(
-        train_terms, train_sentences, train_labels, train_id2label, tokenizer, model_type
+        train_terms, train_sentences, train_labels, train_id2label, tokenizer, model_type_str
     )
 
+    # Configuration LoRA
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
         target_modules=target_modules,
         lora_dropout=0.05,
         bias="none",
-        task_type="SEQ_2_SEQ_LM" if model_type == "seq2seq" else "CAUSAL_LM"
+        task_type="SEQ_2_SEQ_LM" if is_seq2seq else "CAUSAL_LM"
     )
     
     if bnb_config:
         model = prepare_model_for_kbit_training(model)
     
     model = get_peft_model(model, peft_config)
-    
-    # --- FIX ULTIME: BRUTE FORCE FLOAT32 CONVERSION ---
-    # Sur P100, on ne peut ABSOLUMENT PAS avoir de BF16.
-    # Les paramètres "trainable" (LoRA) sont ceux qui posent problème dans l'optimizer.
-    # On les force en float32 (Standard QLoRA = 4bit Base + Float32 Adapters).
-    print(">>> [Sécurité P100] Vérification et conversion FORCEE des paramètres...")
-    
-    count_converted = 0
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            # Si c'est un adapter ou une norme trainable
-            # On force le float32 pour la stabilité numérique et éviter le crash BF16
-            if param.dtype != torch.float32:
-                print(f" -> Conversion {name} de {param.dtype} vers float32")
-                param.data = param.data.to(torch.float32)
-                count_converted += 1
-                
-    print(f">>> {count_converted} paramètres critiques convertis en float32.")
-
     model.print_trainable_parameters()
 
-    from trl import __version__ as trl_version
-    from packaging import version
+    # --- BRANCHE : SÉLECTION DU TRAINER ---
     
-    # --- Training Args: STRICT FP16 (Classic AMP) ---
-    sft_config_kwargs = {
-        "output_dir": f"{output_dir}_checkpoints",
-        "per_device_train_batch_size": 4,
-        "gradient_accumulation_steps": 4,
-        "learning_rate": 2e-4,
-        "logging_steps": 10,
-        "num_train_epochs": 1,
-        "save_strategy": "epoch",
-        "fp16": False,   # Active le scaler FP16 classique (supporté par P100)
-        "bf16": False,  # DESACTIVE le mode BF16 (Crash assuré sur P100)
-        "report_to": "none",
-    }
-    
-    training_args = SFTConfig(**sft_config_kwargs)
-
-    trainer_kwargs = {
-        "model": model,
-        "train_dataset": train_dataset,
-        "args": training_args,
-    }
-
-    current_ver = version.parse(trl_version)
-    if current_ver >= version.parse("0.25.0"):
-        print(f"Détection TRL Récent ({trl_version})")
-        training_args.dataset_text_field = "text"
-        training_args.max_seq_length = 256
-        trainer_kwargs["processing_class"] = tokenizer
+    if is_seq2seq:
+        # >>> STRATÉGIE T5 (Seq2SeqTrainer) <<<
+        print(">>> Utilisation de Seq2SeqTrainer pour T5")
+        
+        # Data Collator spécial qui gère le padding des inputs ET des labels
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer,
+            model=model,
+            label_pad_token_id=-100,
+            pad_to_multiple_of=8
+        )
+        
+        training_args = Seq2SeqTrainingArguments(
+            output_dir=f"{output_dir}_checkpoints",
+            per_device_train_batch_size=8, # T5-Base tient largement en batch 8
+            gradient_accumulation_steps=2,
+            learning_rate=3e-4, # T5 aime les LR un peu plus élevés
+            num_train_epochs=3, # T5 a souvent besoin de plus d'époques que Qwen
+            logging_steps=10,
+            save_strategy="epoch",
+            predict_with_generate=False,
+            fp16=False, 
+            bf16=False,
+            report_to="none",
+        )
+        
+        trainer = Seq2SeqTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+        )
+        
     else:
-        print(f"Détection TRL Ancien ({trl_version})")
-        trainer_kwargs["tokenizer"] = tokenizer
-        trainer_kwargs["dataset_text_field"] = "text"
-        trainer_kwargs["max_seq_length"] = 256
+        # >>> STRATÉGIE QWEN (SFTTrainer / Causal) <<<
+        print(">>> Utilisation de SFTTrainer pour Qwen")
+        
+        training_args = SFTConfig(
+            output_dir=f"{output_dir}_checkpoints",
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=4,
+            learning_rate=2e-4,
+            logging_steps=10,
+            num_train_epochs=1,
+            save_strategy="epoch",
+            fp16=False,
+            bf16=False,
+            dataset_text_field="text",
+            max_seq_length=256,
+            report_to="none",
+        )
 
-    trainer = SFTTrainer(**trainer_kwargs)
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=train_dataset,
+            args=training_args,
+            processing_class=tokenizer 
+        )
 
+    # Lancement
     trainer.train()
     
     print(f"Sauvegarde de l'adaptateur dans {output_dir}...")
     trainer.model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     
+    # Nettoyage
     del model
     del trainer
     torch.cuda.empty_cache()
@@ -700,9 +785,10 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
     
     return output_dir
 
-def evaluate_finetuned_model(model_name_key, adapter_path):
-    print(f"--- Chargement du modèle Fine-Tuné ({model_name_key}) pour évaluation ---")
+def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3):
+    print(f"--- Évaluation : {model_name_key} (RAG={use_rag}, k={k}) ---")
     
+    # 1. Configuration du Modèle (Identique à avant)
     if model_name_key == "Google-Small":
         base_model_id = "google/flan-t5-small"
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
@@ -710,11 +796,16 @@ def evaluate_finetuned_model(model_name_key, adapter_path):
         gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
         gen_func = generate_google_simple 
         
+    elif model_name_key == "Google-Base":
+        base_model_id = "google/flan-t5-base"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16).to("cuda")
+        gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
+        gen_func = generate_google_batched
+
     elif model_name_key == "Qwen":
         base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        
-        # Load in float16 to match what we did in training context
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_id, 
             torch_dtype=torch.float16, 
@@ -723,10 +814,19 @@ def evaluate_finetuned_model(model_name_key, adapter_path):
         gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
         gen_func = generate_qwen_batched
         
-    else: 
+    elif model_name_key == "Google-Large":
         base_model_id = "google/flan-t5-large"
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16, device_map="auto")
+        
+        # CORRECTION : On instancie réellement le modèle ici.
+        # Pas de quantization (bitsandbytes) car on a vu que ça plantait sur P100.
+        # On utilise float16 qui passe largement sur les 16Go de VRAM.
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(
+            base_model_id, 
+            torch_dtype=torch.float16, 
+            device_map="auto"
+        )
+        
         gen_config = GenerationConfig(max_new_tokens=64)
         gen_func = generate_google_batched
 
@@ -734,33 +834,68 @@ def evaluate_finetuned_model(model_name_key, adapter_path):
     model = PeftModel.from_pretrained(base_model, adapter_path)
     model.eval()
 
-    print("Lancement de la boucle de prédiction...")
+    # 2. Chargement du RAG (Uniquement si demandé)
+    embedder = None
+    train_embeddings = None
+    train_terms = []
+    train_labels = []
+    train_sentences = []
     
+    if use_rag:
+        print("Chargement du Train Set et encodage pour le RAG...")
+        embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        # On récupère les données d'entraînement pour chercher les voisins
+        t_id2label, t_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
+        train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
+        print("Index RAG prêt.")
+
+    # 3. Boucle de Prédiction
     available_labels = list(id2label.values())
     correct_predictions = 0
     total_predictions = 0
     
+    # Pour éviter les erreurs avec les générateurs par batch si on est en mode "one-by-one"
+    # On force une liste si la fonction attend un batch, sinon on passe string
+    is_batched_func = "batched" in gen_func.__name__
+
     pbar = tqdm(zip(text, sentences, label), total=len(text))
     
     for test_term, test_sentence, actual_label_idx in pbar:
         actual_label = id2label[actual_label_idx]
         
+        # --- Construction du Prompt ---
+        dynamic_examples = ""
+        if use_rag:
+            # Récupération des voisins dans le Train Set
+            dynamic_examples = get_dynamic_few_shot_examples(
+                test_sentence, test_term, embedder, train_embeddings, 
+                train_terms, train_labels, train_sentences, id2label, k
+            )
+            # Ajout d'une instruction claire pour séparer les exemples de la question
+            dynamic_examples = f"\nHere are some similar examples to help you:\n{dynamic_examples}\n"
+
+        # Le prompt combine la question et (optionnellement) les exemples
         if test_sentence and len(str(test_sentence)) > 3:
-            prompt = f"Given the term '{test_term}' in the sentence '{test_sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
+            base_prompt = f"Given the term '{test_term}' in the sentence '{test_sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}."
         else:
-            prompt = f"What is the type of the term: '{test_term}'? Choose from: {', '.join(available_labels)}. Answer by only giving the term type."
+            base_prompt = f"What is the type of the term: '{test_term}'? Choose from: {', '.join(available_labels)}."
 
+        # On colle les morceaux
+        final_prompt = f"{base_prompt}{dynamic_examples} Answer by only giving the term type."
+
+        # --- Génération ---
         with torch.no_grad():
-            if "batched" in gen_func.__name__:
-                 res = gen_func([prompt], model, tokenizer, gen_config)
+            if is_batched_func:
+                 res = gen_func([final_prompt], model, tokenizer, gen_config)
+                 generated_text = res[0]
             else:
-                 res = gen_func(prompt, model, tokenizer, gen_config)
-            
-            generated_text = res[0] if isinstance(res, list) else res
+                 generated_text = gen_func(final_prompt, model, tokenizer, gen_config)
 
+        # --- Vérification ---
         generated_text_lower = generated_text.lower()
         predicted = "unknown"
         
+        # Logique de parsing robuste
         for lbl in available_labels:
             if lbl in generated_text_lower:
                 predicted = lbl
@@ -772,8 +907,16 @@ def evaluate_finetuned_model(model_name_key, adapter_path):
         
         pbar.set_postfix({"Acc": f"{correct_predictions/total_predictions*100:.2f}%"})
 
-    print(f"Final Accuracy (Fine-Tuned): {correct_predictions/total_predictions*100:.2f}%")
+    final_acc = correct_predictions/total_predictions*100
+    print(f"Final Accuracy ({model_name_key} + FT + RAG={use_rag}): {final_acc:.2f}%")
 
 if __name__ == "__main__":
-    adapter_path = run_finetuning("Qwen", output_dir="./ft_qwen")
-    evaluate_finetuned_model("Qwen", adapter_path)
+    #for k in range(1,11):
+    #    run_classification("classify_term_type_with_dynamic_few_shot", k)
+    #for k in range(1,11):
+    #    run_classification("classify_term_type_with_rag", k)
+    adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
+    evaluate_finetuned_model("Google-Large", "./ft_google_large", use_rag=False, k=0)
+    #for i in range(1,11):
+    #    evaluate_finetuned_model("Google-Base", "./ft_google_base", use_rag=True, k=i)
+    #run_classification("classify_term_type_with_llm", k=0)

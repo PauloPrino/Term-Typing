@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATSH --job-name=llm_test2
+#SBATSH --job-name=llm_test4
 #SBATCH --time=10:00:00
 #SBATCH --partition=P100
 #SBATCH --gres=gpu:2
@@ -16,4 +16,4 @@ export TORCH_NUM_THREADS=10
 
 # Run directly with python. 
 # DataParallel will automatically detect the 2 GPUs provided by --gres=gpu:2
-python -u TermTyping2.py
+python -u TermTyping4.py
