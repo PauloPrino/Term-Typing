@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATSH --job-name=llm_test3
-#SBATCH --time=10:00:00
+#SBATCH --time=20:00:00
 #SBATCH --partition=P100
 #SBATCH --gres=gpu:2
 #SBATCH --ntasks-per-node=1        # CHANGED: Set to 1 so srun runs the script once

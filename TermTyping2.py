@@ -905,8 +905,8 @@ if __name__ == "__main__":
     #    run_classification("classify_term_type_with_dynamic_few_shot", k)
     #for k in range(1,11):
     #    run_classification("classify_term_type_with_rag", k)
-    adapter_path = run_finetuning("Google-Small", output_dir="./ft_google_small")
-    evaluate_finetuned_model("Google-Small", "./ft_google_small", use_rag=False, k=0)
-    #for i in range(1,11):
-    #    evaluate_finetuned_model("Google-Base", "./ft_google_base", use_rag=True, k=i)
+    #adapter_path = run_finetuning("Google-Small", output_dir="./ft_google_small")
+    #evaluate_finetuned_model("Google-Small", "./ft_google_small", use_rag=False, k=0)
+    for i in range(1,11):
+        evaluate_finetuned_model("Google-Small", "./ft_google_small", use_rag=True, k=i)
     #run_classification("classify_term_type_with_llm", k=0)
