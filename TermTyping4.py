@@ -30,6 +30,8 @@ from peft import PeftModel, PeftConfig
 from trl import SFTTrainer, SFTConfig
 import trl
 import sys
+import time
+import gc
 
 # --- Force flush output to see logs immediately ---
 sys.stdout.reconfigure(line_buffering=True)
@@ -43,7 +45,7 @@ print(f"-----------------")
 
 root_path = "/home/infres/pprin-23/LLM/TermTyping"
 
-LLM_MODEL = "Google-Base"
+LLM_MODEL = "Google-Large"
 
 """## 1. Load WordNet Data"""
 
@@ -785,6 +787,8 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
     
     return output_dir
 
+from transformers import BitsAndBytesConfig # Assurez-vous d'avoir cet import
+
 def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, batch_size=16):
     print(f"--- Évaluation : {model_name_key} (RAG={use_rag}, k={k}, Batch Size={batch_size}) ---")
     
@@ -806,19 +810,25 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
     elif model_name_key == "Qwen":
         base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
         
-        # CORRECTION : Forcer le padding à gauche pour la génération
+        # padding_side="left" est CRITIQUE pour la génération batched decoder-only
         tokenizer = AutoTokenizer.from_pretrained(base_model_id, padding_side="left")
-        
-        # S'assurer que le pad_token est défini (souvent EOS pour Qwen)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
             
+        # --- FIX OOM : Chargement 4-bit pour l'Inférence ---
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=False,
+        )
+        
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_id, 
-            torch_dtype=torch.float16, 
+            quantization_config=bnb_config, # <--- C'est ça qui sauve la VRAM
             device_map="auto"
         )
-        gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.pad_token_id)
+        gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
         gen_func = generate_qwen_batched
         
     elif model_name_key == "Google-Large":
@@ -845,12 +855,13 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
     
     if use_rag:
         print("Chargement du Train Set et encodage pour le RAG...")
-        # FIX : On force l'embedder sur le CPU pour ne pas toucher à la VRAM de Qwen
+        # --- FIX OOM : Embedder sur CPU ---
+        # On force l'embedder sur CPU pour laisser toute la VRAM à Qwen
         embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
         
         t_id2label, t_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
         
-        # L'encodage se fera sur CPU, donc pas de surcharge mémoire GPU
+        # Encodage sur CPU (plus lent mais ne plante pas)
         train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
         print("Index RAG prêt.")
 
@@ -859,10 +870,7 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
     correct_predictions = 0
     total_predictions = 0
     
-    # On force une liste pour 'gen_func'
     is_batched_func = "batched" in gen_func.__name__
-    
-    # Création des indices pour le batching
     all_indices = list(range(len(text)))
     pbar = tqdm(total=len(text))
 
@@ -876,8 +884,6 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
         # B. Récupération RAG (Batched)
         batch_dynamic_examples = [""] * len(batch_terms)
         if use_rag:
-            # On utilise la fonction batched existante ou on boucle localement
-            # Ici on réutilise votre fonction 'get_dynamic_few_shot_examples_batched' qui est déjà optimisée
             batch_dynamic_examples = get_dynamic_few_shot_examples_batched(
                 batch_sentences, batch_terms, 
                 embedder, train_embeddings, train_terms, train_labels, train_sentences, 
@@ -904,21 +910,17 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
             if is_batched_func:
                 batch_responses = gen_func(prompts, model, tokenizer, gen_config)
             else:
-                # Fallback pour Google-Small qui n'a pas de fonction batched native dans votre script
                 batch_responses = [gen_func(p, model, tokenizer, gen_config) for p in prompts]
 
         # E. Vérification
         for response, actual_idx in zip(batch_responses, batch_labels_idx):
             resp_lower = response.lower()
             pred = "unknown"
-            
-            # Parsing simple
             for lbl in available_labels:
                 if lbl in resp_lower:
                     pred = lbl
                     break
             
-            # Parsing "First Word" si échec
             if pred == "unknown":
                 first_word = resp_lower.split()[0].strip(".,!:")
                 if first_word in available_labels:
@@ -934,12 +936,337 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
     final_acc = correct_predictions/total_predictions*100
     print(f"Final Accuracy ({model_name_key} + FT + RAG={use_rag}): {final_acc:.2f}%")
     
-    # --- NETTOYAGE MÉMOIRE (FIX OOM) ---
-    # Important pour la boucle for k in range(...)
+    # --- NETTOYAGE MÉMOIRE (CRUCIAL) ---
     del model
     del base_model
     if use_rag:
         del embedder
+    torch.cuda.empty_cache()
+    gc.collect()
+
+import time
+import gc
+import torch
+from peft import PeftModel
+from transformers import BitsAndBytesConfig
+
+def benchmark_all_methods(adapter_path, n_samples=10):
+    print(f"\n=== BENCHMARK DE VITESSE (Moyenne sur {n_samples} échantillons) ===")
+    
+    # 0. Sélection des échantillons
+    sample_indices = range(min(n_samples, len(text)))
+    sample_terms = [text[i] for i in sample_indices]
+    sample_sentences = [sentences[i] for i in sample_indices]
+    
+    # 1. Chargement du Modèle de BASE
+    print(f"--> Chargement du modèle de base : {LLM_MODEL}...")
+    
+    if LLM_MODEL == "Qwen":
+        base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id, padding_side="left")
+        if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+        
+        # 4-bit obligatoire pour éviter OOM si RAG actif
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=False,
+        )
+        model = AutoModelForCausalLM.from_pretrained(base_model_id, quantization_config=bnb_config, device_map="auto")
+        gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
+        gen_func_batched = generate_qwen_batched
+
+    elif LLM_MODEL == "Google-Base":
+        base_model_id = "google/flan-t5-base"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16).to("cuda")
+        gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
+        gen_func_batched = generate_google_batched
+        
+    elif LLM_MODEL == "Google-Large":
+        base_model_id = "google/flan-t5-large"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16, device_map="auto")
+        gen_config = GenerationConfig(max_new_tokens=64)
+        gen_func_batched = generate_google_batched
+        
+    else: # Small
+        base_model_id = "google/flan-t5-small"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float32).to("cuda")
+        gen_config = GenerationConfig(max_new_tokens=64)
+        # Small n'a pas de fonction batched native dans ce script
+        def generate_google_fake_batched(prompts, m, t, c):
+            return [generate_google_simple(p, m, t, c) for p in prompts]
+        gen_func_batched = generate_google_fake_batched
+
+    # --- CRÉATION DU WRAPPER (CORRECTION DU BUG 'LIST') ---
+    # Transforme une fonction qui prend/rend une liste en fonction qui prend/rend un string
+    # pour être compatible avec classify_term_type_with_...
+    def gen_func_single(prompt, m, t, c):
+        # On met le prompt dans une liste, et on récupère le 1er élément de la réponse
+        return gen_func_batched([prompt], m, t, c)[0]
+
+    results = {}
+
+    # --- TEST 1 : CLASSIC LLM ---
+    print("\n[1/5] Test: Classic LLM (Zero-Shot)...")
+    torch.cuda.empty_cache()
+    start = time.time()
+    for t, s in zip(sample_terms, sample_sentences):
+        classify_term_type_with_llm(
+            t, s, available_labels, model, tokenizer, False, 
+            gen_func_single, # <--- On utilise le wrapper ici
+            gen_config
+        )
+    duration = time.time() - start
+    results["Classic LLM"] = duration / n_samples
+    print(f"   -> Temps moyen : {results['Classic LLM']:.4f} s/sample")
+
+    # --- PRÉPARATION RAG (CPU) ---
+    print("\n[Chargement des données RAG sur CPU...]")
+    embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
+    
+    wiki_data = load_dataset("wikitext", "wikitext-103-v1", split="validation")
+    wiki_sentences = [txt for txt in wiki_data['text'] if txt.strip() and len(txt.split()) > 5]
+    # On limite à 5000 phrases pour que l'encodage du benchmark soit rapide
+    wiki_emb = embedder.encode(wiki_sentences[:5000], convert_to_tensor=True).cpu().numpy()
+    
+    t_id2label, t_label2id, tr_terms, tr_labels, tr_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    train_emb = embedder.encode(tr_sentences, convert_to_tensor=True).cpu().numpy()
+
+    # --- TEST 2 : RAG WIKIPEDIA ---
+    print("\n[2/5] Test: RAG Wikipedia...")
+    torch.cuda.empty_cache()
+    start = time.time()
+    for t, s in zip(sample_terms, sample_sentences):
+        classify_term_type_with_rag(
+            t, s, available_labels, model, tokenizer, False, 
+            gen_func_single, # <--- Wrapper
+            gen_config,
+            embedder, wiki_emb, wiki_sentences[:5000], k=3
+        )
+    duration = time.time() - start
+    results["RAG Wikipedia"] = duration / n_samples
+    print(f"   -> Temps moyen : {results['RAG Wikipedia']:.4f} s/sample")
+    
+    del wiki_emb, wiki_sentences
+    gc.collect()
+
+    # --- TEST 3 : RAG TRAIN SET ---
+    print("\n[3/5] Test: RAG Train Set...")
+    torch.cuda.empty_cache()
+    start = time.time()
+    for t, s in zip(sample_terms, sample_sentences):
+        classify_term_type_with_dynamic_few_shot(
+            t, s, available_labels, model, tokenizer, 
+            gen_func_single, # <--- Wrapper
+            gen_config,
+            embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, k=3
+        )
+    duration = time.time() - start
+    results["RAG Train Set"] = duration / n_samples
+    print(f"   -> Temps moyen : {results['RAG Train Set']:.4f} s/sample")
+
+    # --- TEST 4 : FINE-TUNED MODEL ---
+    print("\n[4/5] Chargement Adaptateur & Test Fine-Tuned...")
+    model = PeftModel.from_pretrained(model, adapter_path)
+    model.eval()
+    
+    torch.cuda.empty_cache()
+    start = time.time()
+    # Ici on reconstruit manuellement les prompts pour utiliser le mode batched natif si on veut
+    # Ou on continue avec gen_func_single pour être cohérent
+    for t, s in zip(sample_terms, sample_sentences):
+        classify_term_type_with_llm(
+            t, s, available_labels, model, tokenizer, False, 
+            gen_func_single, 
+            gen_config
+        )
+    duration = time.time() - start
+    results["Fine-Tuned"] = duration / n_samples
+    print(f"   -> Temps moyen : {results['Fine-Tuned']:.4f} s/sample")
+
+    # --- TEST 5 : FINE-TUNED + RAG ---
+    print("\n[5/5] Test: Fine-Tuned + RAG Train...")
+    torch.cuda.empty_cache()
+    start = time.time()
+    for t, s in zip(sample_terms, sample_sentences):
+         classify_term_type_with_dynamic_few_shot(
+            t, s, available_labels, model, tokenizer, 
+            gen_func_single, 
+            gen_config,
+            embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, k=3
+        )
+    duration = time.time() - start
+    results["FT + RAG Train"] = duration / n_samples
+    print(f"   -> Temps moyen : {results['FT + RAG Train']:.4f} s/sample")
+
+    # --- RESUME ---
+    print("\n" + "="*50)
+    print(f"RESULTATS INFERENCE ({LLM_MODEL}, Moyenne sur {n_samples} items)")
+    print("="*50)
+    for method, timing in results.items():
+        print(f"{method:<30} | {timing:.4f} s")
+    print("="*50 + "\n")
+
+    del model, embedder, train_emb
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return results
+
+from collections import Counter
+
+def perform_error_analysis(adapter_path, n_samples=50):
+    print(f"\n=======================================================")
+    print(f"   ANALYSE D'ERREURS DÉTAILLÉE (Sur {n_samples} échantillons)")
+    print(f"=======================================================")
+    
+    # 0. Sélection des données
+    # On prend un subset pour que l'analyse soit rapide
+    indices = range(min(n_samples, len(text)))
+    sample_terms = [text[i] for i in indices]
+    sample_sentences = [sentences[i] for i in indices]
+    sample_labels_ids = [label[i] for i in indices]
+    
+    # 1. Chargement du Modèle (Config Optimisée comme le Benchmark)
+    print(f"--> Chargement du modèle : {LLM_MODEL}...")
+    if LLM_MODEL == "Qwen":
+        base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id, padding_side="left")
+        if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", 
+            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=False
+        )
+        model = AutoModelForCausalLM.from_pretrained(base_model_id, quantization_config=bnb_config, device_map="auto")
+        gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
+        gen_func_batched = generate_qwen_batched
+    elif LLM_MODEL == "Google-Base":
+        base_model_id = "google/flan-t5-base"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16).to("cuda")
+        gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
+        gen_func_batched = generate_google_batched
+    else: 
+        # Fallback pour les autres T5
+        base_model_id = "google/flan-t5-large" if LLM_MODEL == "Google-Large" else "google/flan-t5-small"
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        dtype = torch.float16 if LLM_MODEL == "Google-Large" else torch.float32
+        model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=dtype, device_map="auto" if dtype==torch.float16 else "cuda")
+        gen_config = GenerationConfig(max_new_tokens=64)
+        if LLM_MODEL == "Google-Small":
+            gen_func_batched = lambda p, m, t, c: [generate_google_simple(x, m, t, c) for x in p]
+        else:
+            gen_func_batched = generate_google_batched
+
+    # Wrapper pour compatibilité (List -> String)
+    def gen_func_single(prompt, m, t, c):
+        return gen_func_batched([prompt], m, t, c)[0]
+
+    # 2. Préparation RAG (CPU)
+    print("--> Chargement Index RAG (CPU)...")
+    embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
+    t_id2label, t_label2id, tr_terms, tr_labels, tr_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    # On encode tout le train set ou un subset selon besoins de précision
+    train_emb = embedder.encode(tr_sentences, convert_to_tensor=True).cpu().numpy()
+
+    # --- FONCTION D'ANALYSE INTERNE ---
+    def run_analysis_loop(method_name, prediction_lambda):
+        print(f"\n>>> Analyse Méthode : {method_name}")
+        errors = []
+        correct = 0
+        
+        # On utilise tqdm pour voir la progression
+        for i in tqdm(range(len(sample_terms)), leave=False):
+            t, s, l_idx = sample_terms[i], sample_sentences[i], sample_labels_ids[i]
+            actual = id2label[l_idx]
+            
+            # Prédiction
+            try:
+                pred = prediction_lambda(t, s)
+            except Exception as e:
+                pred = "ERROR"
+            
+            # Normalisation pour comparaison
+            pred_clean = pred.lower().strip()
+            # Nettoyage basique (ex: "noun." -> "noun")
+            for lbl in available_labels:
+                if lbl in pred_clean:
+                    pred_clean = lbl
+                    break
+            
+            if pred_clean == actual:
+                correct += 1
+            else:
+                errors.append({
+                    "term": t, "sentence": s, 
+                    "expected": actual, "predicted": pred_clean, "raw": pred
+                })
+
+        accuracy = correct / len(sample_terms) * 100
+        print(f"   Accuracy: {accuracy:.2f}% ({correct}/{len(sample_terms)})")
+        
+        if errors:
+            # Analyse des Confusions
+            confusions = Counter([(e['expected'], e['predicted']) for e in errors])
+            print("   [Confusions Fréquentes] (Attendu -> Prédit) :")
+            for (exp, prd), count in confusions.most_common(3):
+                print(f"     - {exp} -> {prd} : {count} fois")
+            
+            # Exemples d'erreurs
+            print("   [Exemples d'Erreurs] :")
+            for e in errors[:3]: # Affiche les 3 premières erreurs
+                print(f"     * Terme: '{e['term']}'")
+                print(f"       Phrase: {e['sentence']}")
+                print(f"       ❌ Prédit: {e['predicted']} (Brut: '{e['raw']}') | ✅ Attendu: {e['expected']}")
+                print("       ---")
+        else:
+            print("   🎉 Aucune erreur sur cet échantillon !")
+            
+        return accuracy
+
+    # --- EXECUTION DES SCENARIOS ---
+
+    # 1. Base Zero-Shot
+    run_analysis_loop("Base LLM (Zero-Shot)", 
+        lambda t, s: classify_term_type_with_llm(
+            t, s, available_labels, model, tokenizer, False, gen_func_single, gen_config
+        )
+    )
+
+    # 2. Base + RAG (Train Set)
+    run_analysis_loop("Base LLM + RAG (Dynamic Few-Shot)", 
+        lambda t, s: classify_term_type_with_dynamic_few_shot(
+            t, s, available_labels, model, tokenizer, gen_func_single, gen_config,
+            embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, k=3
+        )
+    )
+
+    # 3. Chargement Fine-Tuned
+    print("\n--> Application de l'adaptateur Fine-Tuned...")
+    model = PeftModel.from_pretrained(model, adapter_path)
+    model.eval()
+
+    # 4. Fine-Tuned Zero-Shot
+    run_analysis_loop("Fine-Tuned (Zero-Shot)", 
+        lambda t, s: classify_term_type_with_llm(
+            t, s, available_labels, model, tokenizer, False, gen_func_single, gen_config
+        )
+    )
+
+    # 5. Fine-Tuned + RAG
+    run_analysis_loop("Fine-Tuned + RAG", 
+        lambda t, s: classify_term_type_with_dynamic_few_shot(
+            t, s, available_labels, model, tokenizer, gen_func_single, gen_config,
+            embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, k=3
+        )
+    )
+
+    # Nettoyage
+    del model, embedder, train_emb
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -950,6 +1277,17 @@ if __name__ == "__main__":
     #    run_classification("classify_term_type_with_rag", k)
     #adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
     #evaluate_finetuned_model("Google-Large", "./ft_google_large", use_rag=False, k=0)
-    for i in range(9,11):
-        evaluate_finetuned_model("Google-Base", "./ft_google_base", use_rag=True, k=i)
+    #for i in range(1,11):
+    #    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i)
     #run_classification("classify_term_type_with_llm", k=0)
+
+    #path_ft = "./ft_google_small"
+    
+    # Lancement du benchmark
+    #benchmark_all_methods(path_ft, n_samples=10)
+
+    # Remplacez par votre dossier d'adaptateur
+    path_ft = "./ft_google_large" 
+    
+    # Lance l'analyse sur 50 phrases au hasard (rapide)
+    perform_error_analysis(path_ft, n_samples=100)
