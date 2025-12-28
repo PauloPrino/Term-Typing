@@ -104,6 +104,34 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 n_gpus = torch.cuda.device_count()
 print(f"Utilisation de {n_gpus} GPUs !")
 
+from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
+
+def calculate_metrics(y_true, y_pred, model_name="Model"):
+    print(f"\n--- 📊 RAPPORT DE PERFORMANCE CORRIGÉ : {model_name} ---")
+    
+    # 1. On définit explicitement les 4 vraies classes (sans 'unknown')
+    # Cela force sklearn à ignorer 'unknown' dans le calcul de la moyenne Macro
+    true_labels = sorted(list(set([l for l in y_true if l != "unknown"])))
+    
+    # 2. Rapport détaillé
+    # 'labels=true_labels' force l'affichage uniquement des vraies classes
+    print(classification_report(y_true, y_pred, labels=true_labels, digits=4, zero_division=0))
+    
+    # 3. Métriques Macro (Sur 4 classes uniquement)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, 
+        average='macro', 
+        labels=true_labels, # <--- C'est la clé : on exclut 'unknown' du diviseur
+        zero_division=0
+    )
+    
+    print(f"🏆 RÉSUMÉ LEADERBOARD ({model_name}):")
+    print(f"  - Accuracy:       {accuracy_score(y_true, y_pred)*100:.2f}%")
+    print(f"  - Macro F1:       {f1*100:.2f}%  <-- SCORE RÉEL (sur 4 classes)")
+    print(f"  - Macro Precision:{precision*100:.2f}%")
+    print(f"  - Macro Recall:   {recall*100:.2f}%")
+    print("-" * 50)
+
 if LLM_MODEL == "Qwen":
     llm_name_qwen = "Qwen/Qwen3-4B-Instruct-2507"
     
@@ -272,6 +300,81 @@ elif LLM_MODEL == "Google-Base":
         )
         outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
         return outputs
+    
+# --- FONCTIONS DE GÉNÉRATION GLOBALES (Hors des if/elif) ---
+
+def generate_qwen_batched(prompts, llm_model, tokenizer_model, generation_cfg):
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Template Chat pour Qwen
+    turns_batch = [[{"role": "user", "content": p}] for p in prompts]
+    text_batch = [
+        tokenizer_model.apply_chat_template(
+            turn, 
+            tokenize=False,
+            add_generation_prompt=True
+        ) 
+        for turn in turns_batch
+    ]
+    
+    batch_inputs = tokenizer_model(
+        text_batch, 
+        padding=True, 
+        return_tensors="pt"
+    ).to(device)
+
+    # Gestion DataParallel / Peft
+    if hasattr(llm_model, "module"):
+        model_to_run = llm_model.module
+    else:
+        model_to_run = llm_model
+
+    generated_ids = model_to_run.generate(
+        **batch_inputs, 
+        max_new_tokens=generation_cfg.max_new_tokens,
+        pad_token_id=tokenizer_model.pad_token_id
+    )
+
+    outputs = []
+    input_len = batch_inputs["input_ids"].shape[-1]
+    for i in range(len(generated_ids)):
+        output_ids = generated_ids[i][input_len:]
+        content = tokenizer_model.decode(output_ids, skip_special_tokens=True)
+        outputs.append(content.strip())
+        
+    return outputs
+
+def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
+    
+    if hasattr(llm_model, "module"):
+        model_to_run = llm_model.module
+    else:
+        model_to_run = llm_model
+
+    generated_ids = model_to_run.generate(
+        **inputs, 
+        max_new_tokens=generation_cfg.max_new_tokens
+    )
+    outputs = tokenizer_model.batch_decode(generated_ids, skip_special_tokens=True)
+    return outputs
+
+def generate_google_simple(prompt, llm_model, tokenizer_model, generation_cfg):
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    inputs = tokenizer_model(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        generated_ids = llm_model.generate(
+            input_ids=inputs.input_ids,
+            max_new_tokens=generation_cfg.max_new_tokens
+        )
+    content = tokenizer_model.decode(generated_ids[0], skip_special_tokens=True)
+    return content.strip()
 
 """## Classification tasks"""
 
@@ -321,125 +424,129 @@ def classify_term_type_with_llm(term, sentence, labels, llm_model, tokenizer_mod
 
 
 def run_classification(classification_task, k):
+    print(f"\n==================================================================")
+    print(f"   ÉVALUATION BASELINE : {LLM_MODEL} | Tâche : {classification_task}")
+    print(f"==================================================================")
+
+    # 1. Sélection Modèle & Générateur
     if LLM_MODEL == "Google-Large":
         active_llm_model = llm_google
         active_tokenizer_model = tokenizer_google
         active_generation_config = generation_config_google
         active_generate_func = generate_google_batched 
-        print("LLM used: Google Flan T5 Large")
     elif LLM_MODEL == "Google-Small":
         active_llm_model = llm_google
         active_tokenizer_model = tokenizer_google
         active_generation_config = generation_config_google
         active_generate_func = generate_google_simple 
-        print("LLM used: Google Flan T5 Small")
     elif LLM_MODEL == "Qwen":
         active_llm_model = llm_qwen
         active_tokenizer_model = tokenizer_qwen
         active_generation_config = generation_config_qwen
         active_generate_func = generate_qwen_batched
-        print("LLM used: Qwen3 4B Instruct")
     elif LLM_MODEL == "Google-Base":
         active_llm_model = llm_google
         active_tokenizer_model = tokenizer_google
         active_generation_config = generation_config_google
         active_generate_func = generate_google_batched
-        print("LLM used: Google Flan T5 Base")
 
-    print(f"Running predictions on Test Set for the classification task {classification_task}")
-
-    if classification_task == "classify_term_type_with_rag":
-        embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        print("Loading Wikitext-103...")
-        wiki_data = load_dataset("wikitext", "wikitext-103-v1", split="validation")
-        wikidata_sentences = [text for text in wiki_data['text'] if text.strip() and len(text.split()) > 5]
-        print(f"RAG Knowledge Base loaded with {len(wikidata_sentences)} Wikipedia sentences.")
-        print("Encoding Wikidata sentences...")
-        wikidata_embeddings = embedder.encode(wikidata_sentences, convert_to_tensor=True).cpu().numpy()
-        print("Encoding complete.")
-    elif classification_task == "classify_term_type_with_dynamic_few_shot":
-        embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        train_id2label, train_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
-        print("Encoding Train sentences for Dynamic Few-Shot...")
-        train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
-        print("Encoding complete.")
-
-    correct_predictions = 0
-    total_predictions = 0
+    # 2. Setup RAG
+    embedder = None
+    rag_corpus = None
+    rag_embeddings = None
     
-    if LLM_MODEL == "Google-Small":
-        print("Mode: Single Item Loop (Colab Compatible)")
-        pbar = tqdm(zip(text, sentences, label), total=len(text))
+    if "rag" in classification_task or "few_shot" in classification_task:
+        print("--> Chargement RAG (CPU)...")
+        embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
         
-        for test_term, test_sentence, actual_label_idx in pbar:
-            actual_label = id2label[actual_label_idx]
+        if classification_task == "classify_term_type_with_rag": # WIKIPEDIA
+            wiki_data = load_dataset("wikitext", "wikitext-103-v1", split="validation")
+            wikidata_sentences = [text for text in wiki_data['text'] if text.strip() and len(text.split()) > 5][:5000]
+            rag_embeddings = embedder.encode(wikidata_sentences, convert_to_tensor=True).cpu().numpy()
+            rag_corpus = wikidata_sentences
+            print("   (Wikidata Index Prêt)")
             
-            if classification_task == "classify_term_type_with_dynamic_few_shot":
-                 predicted_label = classify_term_type_with_dynamic_few_shot(
-                    test_term, test_sentence, available_labels, 
-                    active_llm_model, active_tokenizer_model, 
-                    active_generate_func, active_generation_config,
-                    embedder, train_embeddings, train_terms, train_labels, train_sentences, train_id2label, k
-                )
+        elif classification_task == "classify_term_type_with_dynamic_few_shot": # TRAIN SET
+            t_id2label, t_label2id, tr_terms, tr_labels, tr_sentences = WN_TaskA_TextClf_dataset_builder("train")
+            rag_embeddings = embedder.encode(tr_sentences, convert_to_tensor=True).cpu().numpy()
+            rag_corpus = {
+                "terms": tr_terms, "sentences": tr_sentences, 
+                "labels": tr_labels, "id2label": t_id2label
+            }
+            print("   (TrainSet Index Prêt)")
+
+    # 3. Boucle d'Inférence
+    y_true_all = []
+    y_pred_all = []
+    
+    BATCH_SIZE = 16
+    all_indices = list(range(len(text)))
+    
+    print("--> Démarrage de l'inférence...")
+    pbar = tqdm(total=len(text))
+
+    for i in range(0, len(text), BATCH_SIZE):
+        batch_indices = all_indices[i : i + BATCH_SIZE]
+        batch_terms = [text[j] for j in batch_indices]
+        batch_sentences = [sentences[j] for j in batch_indices]
+        batch_labels_idx = [label[j] for j in batch_indices]
+
+        # Préparation Contextes RAG
+        batch_context_text = [""] * len(batch_terms)
+        
+        if classification_task == "classify_term_type_with_dynamic_few_shot":
+             batch_context_text = get_dynamic_few_shot_examples_batched(
+                batch_sentences, batch_terms, 
+                embedder, rag_embeddings, rag_corpus["terms"], rag_corpus["labels"], rag_corpus["sentences"], 
+                rag_corpus["id2label"], k
+            )
+
+        # Construction Prompts
+        prompts = []
+        for idx, (term, sentence) in enumerate(zip(batch_terms, batch_sentences)):
+            ctx = batch_context_text[idx]
+            if ctx: ctx = f"\nExamples:\n{ctx}\n"
             
-            if predicted_label == actual_label:
-                correct_predictions += 1
-            total_predictions += 1
+            if sentence: prompt = f"Given '{term}' in '{sentence}', type? Options: {', '.join(available_labels)}.{ctx} Answer type only."
+            else: prompt = f"Type of '{term}'? Options: {', '.join(available_labels)}.{ctx} Answer type only."
+            prompts.append(prompt)
 
-            current_accuracy = correct_predictions / total_predictions
-            pbar.set_postfix({f"Accuracy k={k}": f"{current_accuracy * 100:.2f}%"})
-
-    else:
-        print("Mode: Batched Execution")
-        if LLM_MODEL == "Qwen":
-            batch_generate_func = generate_qwen_batched
+        # Génération
+        if "batched" in active_generate_func.__name__:
+            batch_responses = active_generate_func(prompts, active_llm_model, active_tokenizer_model, active_generation_config)
         else:
-            batch_generate_func = generate_google_batched
-            
-        BATCH_SIZE = 16
-        all_indices = list(range(len(text)))
-        pbar = tqdm(total=len(text))
+            batch_responses = [active_generate_func(p, active_llm_model, active_tokenizer_model, active_generation_config) for p in prompts]
 
-        for i in range(0, len(text), BATCH_SIZE):
-            batch_indices = all_indices[i : i + BATCH_SIZE]
-            batch_terms = [text[j] for j in batch_indices]
-            batch_sentences = [sentences[j] for j in batch_indices]
-            batch_labels_idx = [label[j] for j in batch_indices]
-
-            if classification_task == "classify_term_type_with_dynamic_few_shot":
-                 batch_dynamic_examples = get_dynamic_few_shot_examples_batched(
-                    batch_sentences, batch_terms, 
-                    embedder, train_embeddings, train_terms, train_labels, train_sentences, 
-                    train_id2label, k
-                )
-            else:
-                 batch_dynamic_examples = [""] * len(batch_terms)
-
-            prompts = []
-            for idx, (term, sentence) in enumerate(zip(batch_terms, batch_sentences)):
-                dynamic_examples = batch_dynamic_examples[idx]
-                prompt = f"""Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}.\n{dynamic_examples}\nAnswer by only giving the term type."""
-                prompts.append(prompt)
+        # Parsing (CORRIGÉ ICI)
+        for response, actual_idx in zip(batch_responses, batch_labels_idx):
+            resp_lower = response.lower() if response else "" # Protection contre None
+            pred = "unknown"
             
-            batch_responses = batch_generate_func(prompts, active_llm_model, active_tokenizer_model, active_generation_config)
+            for lbl in available_labels:
+                if lbl in resp_lower:
+                    pred = lbl; break
             
-            for response, actual_idx in zip(batch_responses, batch_labels_idx):
-                resp_lower = response.lower()
-                pred = "unknown"
-                for lbl in available_labels:
-                    if lbl in resp_lower:
-                        pred = lbl
-                        break
-                if pred == id2label[actual_idx]:
-                    correct_predictions += 1
-                total_predictions += 1
+            if pred == "unknown":
+                # --- FIX CRASH : Vérifier que la liste n'est pas vide ---
+                split_resp = resp_lower.split()
+                if split_resp: # Si la liste n'est pas vide
+                    fw = split_resp[0].strip(".,!:")
+                    if fw in available_labels: pred = fw
+                # Sinon pred reste "unknown"
             
-            pbar.update(len(batch_indices))
-            current_acc = correct_predictions / total_predictions
-            pbar.set_postfix({"Accuracy": f"{current_acc * 100:.2f}%"})
-
-    accuracy = correct_predictions / total_predictions
-    print(f"\nFinal Accuracy for the classification task {classification_task} and k={k}: {accuracy * 100:.2f}%")
+            y_pred_all.append(pred)
+            y_true_all.append(id2label[actual_idx])
+            
+        pbar.update(len(batch_indices))
+    
+    pbar.close()
+    
+    # 4. Métriques
+    calculate_metrics(y_true_all, y_pred_all, model_name=f"{LLM_MODEL} - {classification_task}")
+    
+    # Nettoyage
+    del embedder, rag_corpus, rag_embeddings
+    gc.collect()
 
 """## RAG"""
 
@@ -790,98 +897,78 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
 from transformers import BitsAndBytesConfig # Assurez-vous d'avoir cet import
 
 def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, batch_size=16):
-    print(f"--- Évaluation : {model_name_key} (RAG={use_rag}, k={k}, Batch Size={batch_size}) ---")
+    print(f"\n==================================================================")
+    print(f"   ÉVALUATION FINE-TUNED : {model_name_key} (RAG={use_rag}, k={k})")
+    print(f"==================================================================")
     
-    # 1. Configuration du Modèle
+    # 1. Configuration du Modèle Base (Optimisé Mémoire)
     if model_name_key == "Google-Small":
         base_model_id = "google/flan-t5-small"
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
         base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float32).to("cuda")
         gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
         gen_func = generate_google_simple 
-        
     elif model_name_key == "Google-Base":
         base_model_id = "google/flan-t5-base"
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
         base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16).to("cuda")
         gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
         gen_func = generate_google_batched
-
     elif model_name_key == "Qwen":
         base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
-        
-        # padding_side="left" est CRITIQUE pour la génération batched decoder-only
         tokenizer = AutoTokenizer.from_pretrained(base_model_id, padding_side="left")
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-            
-        # --- FIX OOM : Chargement 4-bit pour l'Inférence ---
+        if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+        # FIX OOM : Qwen en 4-bit OBLIGATOIRE pour l'inférence avec RAG
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=False,
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", 
+            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=False
         )
-        
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_id, 
-            quantization_config=bnb_config, # <--- C'est ça qui sauve la VRAM
-            device_map="auto"
-        )
+        base_model = AutoModelForCausalLM.from_pretrained(base_model_id, quantization_config=bnb_config, device_map="auto")
         gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
         gen_func = generate_qwen_batched
-        
     elif model_name_key == "Google-Large":
         base_model_id = "google/flan-t5-large"
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(
-            base_model_id, 
-            torch_dtype=torch.float16, 
-            device_map="auto"
-        )
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16, device_map="auto")
         gen_config = GenerationConfig(max_new_tokens=64)
         gen_func = generate_google_batched
 
-    print(f"Chargement des poids LoRA depuis {adapter_path}...")
-    model = PeftModel.from_pretrained(base_model, adapter_path)
-    model.eval()
+    # 2. Chargement de l'Adaptateur LoRA
+    print(f"--> Chargement des poids LoRA depuis {adapter_path}...")
+    try:
+        model = PeftModel.from_pretrained(base_model, adapter_path)
+        model.eval()
+    except Exception as e:
+        print(f"ERREUR CRITIQUE: Impossible de charger l'adaptateur. Vérifiez le chemin. ({e})")
+        return
 
-    # 2. Chargement du RAG (Embeddings)
+    # 3. Préparation RAG (CPU pour économiser GPU)
     embedder = None
     train_embeddings = None
-    train_terms = []
-    train_labels = []
-    train_sentences = []
-    
     if use_rag:
-        print("Chargement du Train Set et encodage pour le RAG...")
-        # --- FIX OOM : Embedder sur CPU ---
-        # On force l'embedder sur CPU pour laisser toute la VRAM à Qwen
+        print("--> Chargement Index RAG (sur CPU)...")
         embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
-        
         t_id2label, t_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
-        
-        # Encodage sur CPU (plus lent mais ne plante pas)
         train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
-        print("Index RAG prêt.")
 
-    # 3. Boucle de Prédiction par Batch
+    # 4. Boucle d'Inférence (Batched)
     available_labels = list(id2label.values())
-    correct_predictions = 0
-    total_predictions = 0
+    y_true_all = []
+    y_pred_all = []
     
     is_batched_func = "batched" in gen_func.__name__
-    all_indices = list(range(len(text)))
+    all_indices = list(range(len(text))) # text = Test terms globaux
+    
+    print("--> Démarrage de l'inférence...")
     pbar = tqdm(total=len(text))
 
     for i in range(0, len(text), batch_size):
-        # A. Préparation du Batch
         batch_indices = all_indices[i : i + batch_size]
         batch_terms = [text[j] for j in batch_indices]
         batch_sentences = [sentences[j] for j in batch_indices]
         batch_labels_idx = [label[j] for j in batch_indices]
 
-        # B. Récupération RAG (Batched)
+        # A. Contexte RAG
         batch_dynamic_examples = [""] * len(batch_terms)
         if use_rag:
             batch_dynamic_examples = get_dynamic_few_shot_examples_batched(
@@ -890,7 +977,7 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
                 id2label, k
             )
 
-        # C. Construction des Prompts
+        # B. Construction des Prompts
         prompts = []
         for idx, (term, sentence) in enumerate(zip(batch_terms, batch_sentences)):
             dynamic_examples = batch_dynamic_examples[idx]
@@ -902,45 +989,47 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
             else:
                 base_prompt = f"What is the type of the term: '{term}'? Choose from: {', '.join(available_labels)}."
 
-            final_prompt = f"{base_prompt}{dynamic_examples} Answer by only giving the term type."
-            prompts.append(final_prompt)
+            prompts.append(f"{base_prompt}{dynamic_examples} Answer by only giving the term type.")
 
-        # D. Génération (Batched)
+        # C. Génération
         with torch.no_grad():
             if is_batched_func:
                 batch_responses = gen_func(prompts, model, tokenizer, gen_config)
             else:
                 batch_responses = [gen_func(p, model, tokenizer, gen_config) for p in prompts]
 
-        # E. Vérification
+        # D. Parsing des Réponses
         for response, actual_idx in zip(batch_responses, batch_labels_idx):
-            resp_lower = response.lower()
+            resp_lower = response.lower() if response else ""
             pred = "unknown"
+            
+            # Recherche exacte
             for lbl in available_labels:
                 if lbl in resp_lower:
                     pred = lbl
                     break
             
+            # Recherche premier mot (fallback)
             if pred == "unknown":
-                first_word = resp_lower.split()[0].strip(".,!:")
-                if first_word in available_labels:
-                    pred = first_word
+                # --- FIX CRASH ---
+                split_resp = resp_lower.split()
+                if split_resp:
+                    first_word = split_resp[0].strip(".,!:")
+                    if first_word in available_labels:
+                        pred = first_word
 
-            if pred == id2label[actual_idx]:
-                correct_predictions += 1
-            total_predictions += 1
+            y_pred_all.append(pred)
+            y_true_all.append(id2label[actual_idx])
         
         pbar.update(len(batch_indices))
-        pbar.set_postfix({"Acc": f"{correct_predictions/total_predictions*100:.2f}%"})
-
-    final_acc = correct_predictions/total_predictions*100
-    print(f"Final Accuracy ({model_name_key} + FT + RAG={use_rag}): {final_acc:.2f}%")
     
-    # --- NETTOYAGE MÉMOIRE (CRUCIAL) ---
-    del model
-    del base_model
-    if use_rag:
-        del embedder
+    pbar.close()
+
+    # 5. Calcul des Métriques Finales
+    calculate_metrics(y_true_all, y_pred_all, model_name=f"{model_name_key} (FT + RAG={use_rag})")
+    
+    # 6. Nettoyage Mémoire
+    del model, base_model, embedder
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -1282,36 +1371,56 @@ from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
 from datasets import load_dataset
 
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import gc
+import torch
+from peft import PeftModel
+from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, GenerationConfig
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+import os
+
 def run_full_error_analysis_matrix(n_samples=100):
     print(f"\n=================================================================================")
     print(f"   ANALYSE D'ERREURS & SAUVEGARDE DES MATRICES ({n_samples} échantillons)")
     print(f"=================================================================================")
 
+    # Crée le dossier pour stocker les images si inexistant
+    if not os.path.exists("ConfusionMatrix"):
+        os.makedirs("ConfusionMatrix")
+
     # --- 1. CONFIGURATION DES MODÈLES ---
-    # Vérifiez bien vos chemins ici
+    # Activez uniquement ceux que vous voulez tester
     MODELS_CONFIG = {
         "Qwen": {"path": "./ft_qwen", "type": "causal"},
-        "Google-Base": {"path": "./ft_google_base", "type": "seq2seq"},
-        # Ajoutez les autres si besoin : "Google-Large": ...
+        # "Google-Base": {"path": "./ft_google_base", "type": "seq2seq"},
+        # "Google-Large": {"path": "./ft_google_large", "type": "seq2seq"},
     }
     
     # --- 2. PRÉPARATION DES DONNÉES (CPU) ---
     print("--> Chargement des données et de l'Embedder RAG sur CPU...")
+    # Sélection des indices
     indices = range(min(n_samples, len(text)))
     sample_terms = [text[i] for i in indices]
     sample_sentences = [sentences[i] for i in indices]
     sample_labels_ids = [label[i] for i in indices]
     y_true = [id2label[i] for i in sample_labels_ids]
-    # On force l'ordre des labels pour que les matrices soient cohérentes entre elles
-    labels_list = sorted(list(set(y_true))) 
+    
+    # [CRITIQUE] On récupère la liste complète des labels possibles (WordNet)
+    # pour que la matrice ait toujours la taille 4x4 + Unknown
+    labels_list = sorted(list(id2label.values())) 
 
     embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
     
-    # Train Index (pour RAG Train)
+    # Index Train (pour RAG Train)
     t_id2label, t_label2id, tr_terms, tr_labels, tr_sentences = WN_TaskA_TextClf_dataset_builder("train")
     train_emb = embedder.encode(tr_sentences, convert_to_tensor=True).cpu().numpy()
     
-    # Wiki Index (pour RAG Wiki) - Subset 2000 phrases pour aller vite
+    # Index Wiki (pour RAG Wiki) - Subset pour vitesse
     wiki_data = load_dataset("wikitext", "wikitext-103-v1", split="validation")
     wiki_sentences = [txt for txt in wiki_data['text'] if txt.strip() and len(txt.split()) > 5][:2000]
     wiki_emb = embedder.encode(wiki_sentences, convert_to_tensor=True).cpu().numpy()
@@ -1332,6 +1441,7 @@ def run_full_error_analysis_matrix(n_samples=100):
         gen_func_batched = None
 
         try:
+            # Logique de chargement selon le modèle
             if model_key == "Qwen":
                 base_id = "Qwen/Qwen3-4B-Instruct-2507"
                 tokenizer = AutoTokenizer.from_pretrained(base_id, padding_side="left")
@@ -1341,36 +1451,39 @@ def run_full_error_analysis_matrix(n_samples=100):
                 gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
                 gen_func_batched = generate_qwen_batched
             else:
-                # Google T5
                 base_id = f"google/flan-t5-{model_key.split('-')[1].lower()}"
                 tokenizer = AutoTokenizer.from_pretrained(base_id)
                 dtype = torch.float32 if "Small" in model_key else torch.float16
                 model = AutoModelForSeq2SeqLM.from_pretrained(base_id, torch_dtype=dtype).to("cuda")
                 gen_config = GenerationConfig(max_new_tokens=64)
                 if "Small" in model_key:
+                    # Wrapper pour Small qui n'a pas de batch natif
                     gen_func_batched = lambda p, m, t, c: [generate_google_simple(x, m, t, c) for x in p]
                 else:
                     gen_func_batched = generate_google_batched
             
+            # Wrapper unique (transforme liste -> string pour les fonctions existantes)
             def predict_single(p, m, t, c): return gen_func_batched([p], m, t, c)[0]
 
-            # B. Définition des Scénarios
+            # B. Définition des 5 Scénarios
+            # Les lambdas permettent de différer l'exécution
             scenarios = {
                 "1_Original_LLM": lambda t, s: classify_term_type_with_llm(t, s, available_labels, model, tokenizer, False, predict_single, gen_config),
                 "2_RAG_Wikipedia": lambda t, s: classify_term_type_with_rag(t, s, available_labels, model, tokenizer, False, predict_single, gen_config, embedder, wiki_emb, wiki_sentences, 3),
                 "3_RAG_TrainSet": lambda t, s: classify_term_type_with_dynamic_few_shot(t, s, available_labels, model, tokenizer, predict_single, gen_config, embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, 3),
-                "4_FineTuned": None, 
+                "4_FineTuned": None, # Sera rempli après chargement adaptateur
                 "5_FT_RAG_Train": None 
             }
 
             results_storage = {}
             
-            # C. Inférence PRE-FineTuning
+            # C. Inférence PRE-FineTuning (Baselines)
             for name, func in scenarios.items():
                 if func is None: continue 
                 print(f"   -> Inference: {name}...")
                 y_pred = []
                 for t, s in zip(sample_terms, sample_sentences):
+                    # Nettoyage basique du texte généré
                     y_pred.append(func(t, s).lower().strip().split()[0].strip(".,!:"))
                 results_storage[name] = y_pred
 
@@ -1379,6 +1492,7 @@ def run_full_error_analysis_matrix(n_samples=100):
             try:
                 model = PeftModel.from_pretrained(model, config['path'])
                 model.eval()
+                # On définit les fonctions maintenant que le modèle est Fine-Tuné
                 scenarios["4_FineTuned"] = lambda t, s: classify_term_type_with_llm(t, s, available_labels, model, tokenizer, False, predict_single, gen_config)
                 scenarios["5_FT_RAG_Train"] = lambda t, s: classify_term_type_with_dynamic_few_shot(t, s, available_labels, model, tokenizer, predict_single, gen_config, embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, 3)
 
@@ -1389,17 +1503,17 @@ def run_full_error_analysis_matrix(n_samples=100):
                         y_pred.append(scenarios[name](t, s).lower().strip().split()[0].strip(".,!:"))
                     results_storage[name] = y_pred
             except Exception as e:
-                print(f"   [!] Erreur Adaptateur {model_key}: {e}")
+                print(f"   [!] Impossible de charger l'adaptateur pour {model_key} (Erreur: {e})")
 
-            # E. ANALYSE ET SAUVEGARDE
+            # E. ANALYSE STATISTIQUE ET VISUELLE
             print(f"\n   --- GÉNÉRATION DES RAPPORTS : {model_key} ---")
             
             for scenario_name, y_pred_raw in results_storage.items():
-                # Nettoyage
+                # 1. Nettoyage et Alignement des Labels
                 y_pred_clean = []
-                hallucinations = 0
                 for p in y_pred_raw:
                     found = False
+                    # On cherche si la réponse contient un des labels valides
                     for valid in labels_list:
                         if valid in p:
                             y_pred_clean.append(valid)
@@ -1407,55 +1521,63 @@ def run_full_error_analysis_matrix(n_samples=100):
                             break
                     if not found:
                         y_pred_clean.append("unknown")
-                        hallucinations += 1
                 
-                # Metrics
-                acc = sum([1 for i in range(len(y_true)) if y_true[i] == y_pred_clean[i]]) / len(y_true) * 100
-                hallucination_rate = hallucinations / len(y_true) * 100
-                
-                print(f"\n   >>> {scenario_name} (Acc: {acc:.2f}% | Hallu: {hallucination_rate:.1f}%)")
+                # 2. Calcul des Métriques Leaderboard (Macro F1, etc.)
+                # C'est ICI qu'on appelle votre fonction calculate_metrics
+                print(f"\n   >>> Scénario : {scenario_name}")
+                try:
+                    calculate_metrics(y_true, y_pred_clean, model_name=f"{model_key} - {scenario_name}")
+                except Exception as met_err:
+                    print(f"   (Erreur affichage métriques: {met_err})")
 
-                # Matrice de Confusion
-                labels_matrix = labels_list + ["unknown"]
-                cm = confusion_matrix(y_true, y_pred_clean, labels=labels_matrix)
+                # 3. Préparation Matrice de Confusion
+                # Labels attendus dans la matrice (Classes + Unknown)
+                matrix_labels = labels_list + ["unknown"]
+                
+                # On force 'labels=' pour inclure les classes vides (Adverbe, etc.)
+                cm = confusion_matrix(y_true, y_pred_clean, labels=matrix_labels)
                 
                 # Normalisation en %
                 with np.errstate(divide='ignore', invalid='ignore'):
                     cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
                     cm_percent = np.nan_to_num(cm_percent)
 
-                # --- SAUVEGARDE IMAGE ---
+                # 4. Sauvegarde Image (Seaborn Heatmap)
                 plt.figure(figsize=(10, 8))
-                df_cm = pd.DataFrame(cm_percent, index=labels_matrix, columns=labels_matrix)
+                df_cm = pd.DataFrame(cm_percent, index=matrix_labels, columns=matrix_labels)
                 
+                # Carte de chaleur (Bleu)
                 sns.heatmap(df_cm, annot=True, fmt='.1f', cmap='Blues', vmin=0, vmax=100)
-                plt.title(f"Confusion Matrix (%)\nModel: {model_key} | Method: {scenario_name}\nAcc: {acc:.1f}%")
+                
+                acc_score = sum([1 for i in range(len(y_true)) if y_true[i] == y_pred_clean[i]]) / len(y_true) * 100
+                plt.title(f"Confusion Matrix (%)\nModel: {model_key} | Method: {scenario_name}\nAcc: {acc_score:.1f}%")
                 plt.ylabel('True Label')
                 plt.xlabel('Predicted Label')
                 
-                filename = f"CM_{model_key}_{scenario_name}.png"
+                filename = f"ConfusionMatrix/CM_{model_key}_{scenario_name}.png"
                 plt.savefig(filename)
-                plt.close() # Important pour libérer la mémoire graphique
-                print(f"       [Sauvegardé] -> {filename}")
+                plt.close()
+                print(f"       [Image Sauvegardée] -> {filename}")
 
-                # --- LOG CONSOLE (TOP ERREURS) ---
+                # 5. Affichage Top Erreurs (Console)
                 errors = []
-                for i in range(len(labels_matrix)): 
-                    for j in range(len(labels_matrix)): 
+                for i in range(len(matrix_labels)): 
+                    for j in range(len(matrix_labels)): 
                         if i != j and cm[i, j] > 0:
+                            # Ratio par rapport à la classe réelle (ex: 50% des verbes sont faux)
                             ratio = cm[i, j] / cm[i].sum() * 100
-                            errors.append((labels_matrix[i], labels_matrix[j], ratio))
+                            errors.append((matrix_labels[i], matrix_labels[j], ratio))
                 
                 errors.sort(key=lambda x: x[2], reverse=True)
                 if errors:
-                    print("       Top Erreurs : " + ", ".join([f"{e[0]}->{e[1]} ({e[2]:.0f}%)" for e in errors[:3]]))
+                    print("       Top Erreurs (Freq > 0) : " + ", ".join([f"{e[0]}->{e[1]} ({e[2]:.0f}%)" for e in errors[:3]]))
 
         except Exception as e:
-            print(f"ERREUR CRITIQUE {model_key}: {e}")
+            print(f"ERREUR CRITIQUE SUR {model_key}: {e}")
             import traceback
             traceback.print_exc()
         
-        # Nettoyage VRAM
+        # Nettoyage VRAM entre modèles
         del model, tokenizer
         torch.cuda.empty_cache()
         gc.collect()
@@ -1463,9 +1585,76 @@ def run_full_error_analysis_matrix(n_samples=100):
     del embedder, train_emb, wiki_emb
     gc.collect()
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from collections import Counter
+
+def analyze_dataset_stats():
+    print(f"\n=======================================================")
+    print(f"   ANALYSE STATISTIQUE DU DATASET (Train vs Test)")
+    print(f"=======================================================")
+
+    # 1. Chargement des données brutes
+    print("--> Chargement des datasets...")
+    # On ignore les textes, on veut juste les labels
+    _, _, _, train_labels_ids, _ = WN_TaskA_TextClf_dataset_builder("train")
+    _, _, _, test_labels_ids, _ = WN_TaskA_TextClf_dataset_builder("test")
+    
+    # Conversion ID -> Nom (ex: 0 -> 'noun')
+    train_labels = [id2label[i] for i in train_labels_ids]
+    test_labels = [id2label[i] for i in test_labels_ids]
+    
+    # 2. Calcul des Stats
+    def get_stats(labels, name):
+        total = len(labels)
+        counts = Counter(labels)
+        print(f"\n--- {name} Set (Total: {total}) ---")
+        stats = []
+        for lbl, count in counts.most_common():
+            pct = count / total * 100
+            print(f"   {lbl:<10} : {count:>5}  ({pct:>5.2f}%)")
+            stats.append({"Label": lbl, "Count": count, "Percentage": pct, "Split": name})
+        return stats
+
+    data_stats = []
+    data_stats.extend(get_stats(train_labels, "TRAIN"))
+    data_stats.extend(get_stats(test_labels, "TEST"))
+    
+    # 3. Création du DataFrame pour le graphique
+    df_stats = pd.DataFrame(data_stats)
+    
+    # 4. Visualisation (Sauvegarde PNG)
+    print("\n--> Génération du graphique de distribution...")
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+    
+    # Graphique en barres côte à côte
+    ax = sns.barplot(data=df_stats, x="Label", y="Percentage", hue="Split", palette="viridis")
+    
+    plt.title("Distribution des Classes (Train vs Test)", fontsize=14)
+    plt.ylabel("Pourcentage (%)", fontsize=12)
+    plt.xlabel("Type de Terme", fontsize=12)
+    plt.legend(title="Dataset")
+    
+    # Ajout des valeurs au-dessus des barres
+    for container in ax.containers:
+        ax.bar_label(container, fmt='%.1f%%', padding=3)
+
+    filename = "Dataset_Distribution.png"
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    
+    print(f"   [Sauvegardé] -> {filename}")
+    print("=======================================================\n")
+
 if __name__ == "__main__":
-    #for k in range(1,11):
-    #    run_classification("classify_term_type_with_dynamic_few_shot", k)
+    print(f"=====================K = {0} ========================")
+    run_classification("classify_term_type_with_llm", k=0)
+    for k in range(1,11):
+        print(f"\n\n================== K = {k} ==================")
+        run_classification("classify_term_type_with_dynamic_few_shot", k)
     #for k in range(1,11):
     #    run_classification("classify_term_type_with_rag", k)
     #adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
@@ -1485,4 +1674,6 @@ if __name__ == "__main__":
     # Lance l'analyse sur 50 phrases au hasard (rapide)
     #perform_error_analysis(path_ft, n_samples=100)
 
-    run_full_error_analysis_matrix(n_samples=100)
+    #run_full_error_analysis_matrix(n_samples=100)
+
+    #analyze_dataset_stats()
