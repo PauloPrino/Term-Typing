@@ -500,6 +500,16 @@ def run_classification(classification_task, k):
                 embedder, rag_embeddings, rag_corpus["terms"], rag_corpus["labels"], rag_corpus["sentences"], 
                 rag_corpus["id2label"], k
             )
+             
+        elif classification_task == "classify_term_type_with_rag":
+            # On doit récupérer le contexte pour chaque phrase du batch
+            # Note: Vous devrez implémenter une version batched de get_rag_context pour l'efficacité
+            current_batch_contexts = []
+            for sent in batch_sentences:
+                # Appel à votre fonction existante (non-batchée mais fonctionnelle)
+                ctx = get_rag_context(sent, embedder, rag_embeddings, rag_corpus, k)
+                current_batch_contexts.append(ctx)
+            batch_context_text = current_batch_contexts
 
         # Construction Prompts
         prompts = []
@@ -857,26 +867,31 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
         # >>> STRATÉGIE QWEN (SFTTrainer / Causal) <<<
         print(">>> Utilisation de SFTTrainer pour Qwen")
         
+        # 1. On crée la config SANS max_seq_length pour éviter le crash TypeError
         training_args = SFTConfig(
             output_dir=f"{output_dir}_checkpoints",
-            per_device_train_batch_size=4,
+            per_device_train_batch_size=32,
             gradient_accumulation_steps=4,
             learning_rate=2e-4,
             logging_steps=10,
-            num_train_epochs=1,
+            num_train_epochs=3,
             save_strategy="epoch",
             fp16=False,
             bf16=False,
             dataset_text_field="text",
-            max_seq_length=256,
+            group_by_length=True,
             report_to="none",
         )
 
+        # 2. On l'injecte manuellement "de force" (C'est sale mais ça marche à tous les coups)
+        training_args.max_seq_length = 256
+
+        # 3. On initialise le Trainer SANS max_seq_length
         trainer = SFTTrainer(
             model=model,
             train_dataset=train_dataset,
-            args=training_args,
-            processing_class=tokenizer 
+            args=training_args,        # Le trainer lira args.max_seq_length ici
+            processing_class=tokenizer,
         )
 
     # Lancement
@@ -1649,18 +1664,211 @@ def analyze_dataset_stats():
     print(f"   [Sauvegardé] -> {filename}")
     print("=======================================================\n")
 
+def run_full_benchmark_and_viz(n_samples=100):
+    print(f"\n=================================================================================")
+    print(f"   BENCHMARK GLOBAL & VISUALISATION COMBINÉE ({n_samples} échantillons)")
+    print(f"=================================================================================")
+
+    if not os.path.exists("GlobalResults"):
+        os.makedirs("GlobalResults")
+
+    # --- 1. CONFIGURATION ---
+    # Adaptez les chemins vers VOS modèles fine-tunés ici
+    MODELS_CONFIG = {
+        "Qwen": {"path": "./ft_qwen", "type": "causal"},
+        "Google-Small": {"path": "./ft_google_small", "type": "seq2seq"},
+        # Ajoutez d'autres modèles ici si vous avez les adaptateurs
+        # "Google-Large": {"path": "./ft_google_large", "type": "seq2seq"},
+    }
+    
+    # Stockage global pour les graphiques finaux
+    # Structure : global_results[Model][Method] = { "cm": matrice, "acc": float }
+    global_results = {m: {} for m in MODELS_CONFIG.keys()}
+    
+    # --- 2. PRÉPARATION DES DONNÉES (CPU) ---
+    print("--> Chargement Data & Embedder...")
+    indices = range(min(n_samples, len(text)))
+    sample_terms = [text[i] for i in indices]
+    sample_sentences = [sentences[i] for i in indices]
+    sample_labels_ids = [label[i] for i in indices]
+    y_true = [id2label[i] for i in sample_labels_ids]
+    
+    # Liste fixe des labels pour avoir des matrices de même taille partout
+    labels_list = sorted(list(id2label.values()))
+    matrix_labels = labels_list + ["unknown"]
+
+    embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
+    t_id2label, t_label2id, tr_terms, tr_labels, tr_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    train_emb = embedder.encode(tr_sentences, convert_to_tensor=True).cpu().numpy()
+    
+    wiki_data = load_dataset("wikitext", "wikitext-103-v1", split="validation")
+    wiki_sentences = [txt for txt in wiki_data['text'] if txt.strip() and len(txt.split()) > 5][:2000]
+    wiki_emb = embedder.encode(wiki_sentences, convert_to_tensor=True).cpu().numpy()
+
+    # --- 3. BOUCLE D'INFÉRENCE ---
+    for model_key, config in MODELS_CONFIG.items():
+        print(f"\n>>> Traitement Modèle : {model_key}")
+        
+        # A. Chargement Modèle Base
+        # (Note: Je simplifie la logique ici pour la lisibilité, assurez-vous que les imports sont bons)
+        tokenizer = None; model = None; gen_config = None; gen_func_batched = None
+        
+        try:
+            if config["type"] == "causal": # Qwen
+                base_id = "Qwen/Qwen3-4B-Instruct-2507"
+                tokenizer = AutoTokenizer.from_pretrained(base_id, padding_side="left")
+                if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+                bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+                model = AutoModelForCausalLM.from_pretrained(base_id, quantization_config=bnb, device_map="auto")
+                gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
+                gen_func_batched = generate_qwen_batched
+            else: # T5
+                base_id = f"google/flan-t5-{model_key.split('-')[1].lower()}"
+                tokenizer = AutoTokenizer.from_pretrained(base_id)
+                model = AutoModelForSeq2SeqLM.from_pretrained(base_id, torch_dtype=torch.float32).to("cuda")
+                gen_config = GenerationConfig(max_new_tokens=64)
+                # Petit hack pour T5-Small qui n'a pas de batch natif dans votre code original
+                if "Small" in model_key: gen_func_batched = lambda p, m, t, c: [generate_google_simple(x, m, t, c) for x in p]
+                else: gen_func_batched = generate_google_batched
+
+            def predict_single(p, m, t, c): return gen_func_batched([p], m, t, c)[0]
+
+            # B. Définition des Scénarios
+            scenarios = {
+                "Zero-Shot": lambda t, s: classify_term_type_with_llm(t, s, available_labels, model, tokenizer, False, predict_single, gen_config),
+                "RAG Wiki": lambda t, s: classify_term_type_with_rag(t, s, available_labels, model, tokenizer, False, predict_single, gen_config, embedder, wiki_emb, wiki_sentences, 3),
+                "RAG Train": lambda t, s: classify_term_type_with_dynamic_few_shot(t, s, available_labels, model, tokenizer, predict_single, gen_config, embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, 3),
+                "Fine-Tuned": None,
+                "FT + RAG": None 
+            }
+
+            # C. Inférence Base (Avant chargement adaptateur)
+            for name, func in scenarios.items():
+                if func is None: continue 
+                print(f"   -> {name}...")
+                y_pred = [func(t, s).lower().strip().split()[0].strip(".,!:") for t, s in zip(sample_terms, sample_sentences)]
+                
+                # Nettoyage et Calcul CM
+                y_pred_clean = [l if l in labels_list else "unknown" for l in y_pred]
+                cm = confusion_matrix(y_true, y_pred_clean, labels=matrix_labels)
+                acc = accuracy_score(y_true, y_pred_clean) * 100
+                
+                # Normalisation
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+                    cm_norm = np.nan_to_num(cm_norm)
+                
+                global_results[model_key][name] = {"cm": cm_norm, "acc": acc}
+
+            # D. Chargement Adaptateur & Inférence Fine-Tuned
+            if os.path.exists(config['path']):
+                print(f"   -> Chargement Adaptateur {config['path']}...")
+                model = PeftModel.from_pretrained(model, config['path'])
+                model.eval()
+                
+                scenarios["Fine-Tuned"] = lambda t, s: classify_term_type_with_llm(t, s, available_labels, model, tokenizer, False, predict_single, gen_config)
+                scenarios["FT + RAG"] = lambda t, s: classify_term_type_with_dynamic_few_shot(t, s, available_labels, model, tokenizer, predict_single, gen_config, embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, 3)
+
+                for name in ["Fine-Tuned", "FT + RAG"]:
+                    print(f"   -> {name}...")
+                    y_pred = [scenarios[name](t, s).lower().strip().split()[0].strip(".,!:") for t, s in zip(sample_terms, sample_sentences)]
+                    y_pred_clean = [l if l in labels_list else "unknown" for l in y_pred]
+                    cm = confusion_matrix(y_true, y_pred_clean, labels=matrix_labels)
+                    acc = accuracy_score(y_true, y_pred_clean) * 100
+                    
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+                        cm_norm = np.nan_to_num(cm_norm)
+
+                    global_results[model_key][name] = {"cm": cm_norm, "acc": acc}
+            else:
+                print(f"   [!] Adaptateur introuvable pour {model_key}, skip FT.")
+
+        except Exception as e:
+            print(f"ERREUR {model_key}: {e}")
+        
+        del model, tokenizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # --- 4. GÉNÉRATION DES GRAPHIQUES COMBINÉS ---
+    print("\n>>> Génération des visualisations globales...")
+    
+    methods_order = ["Zero-Shot", "RAG Wiki", "RAG Train", "Fine-Tuned", "FT + RAG"]
+    models_order = list(MODELS_CONFIG.keys())
+    
+    # A. La "SUPER-GRILLE" de Matrices de Confusion
+    n_rows = len(models_order)
+    n_cols = len(methods_order)
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows), sharex=True, sharey=True)
+    if n_rows == 1: axes = np.array([axes]) # Fix dimensions si 1 seul modèle
+    if n_cols == 1: axes = axes[:, np.newaxis] # Fix dimensions si 1 seule méthode
+    if len(axes.shape) == 1: axes = axes.reshape(n_rows, n_cols) # Safety
+
+    for i, mod in enumerate(models_order):
+        for j, meth in enumerate(methods_order):
+            ax = axes[i, j]
+            
+            if meth in global_results[mod]:
+                data = global_results[mod][meth]
+                sns.heatmap(data["cm"], annot=True, fmt=".0f", cmap="Blues", 
+                            vmin=0, vmax=100, cbar=False, ax=ax,
+                            xticklabels=matrix_labels, yticklabels=matrix_labels, annot_kws={"size": 8})
+                ax.set_title(f"Acc: {data['acc']:.1f}%", fontsize=10, color='darkgreen')
+            else:
+                ax.text(0.5, 0.5, "N/A", ha='center', va='center')
+                
+            # Titres colonnes (Méthodes)
+            if i == 0: ax.text(0.5, 1.15, meth, transform=ax.transAxes, ha='center', fontsize=12, fontweight='bold')
+            # Titres lignes (Modèles)
+            if j == 0: ax.set_ylabel(f"{mod}\nTrue Label", fontsize=11, fontweight='bold')
+            else: ax.set_ylabel("")
+            
+            if i == n_rows - 1: ax.set_xlabel("Predicted")
+            else: ax.set_xlabel("")
+
+    plt.suptitle("Comparaison Complète : Matrices de Confusion par Modèle & Méthode", fontsize=16, y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig("GlobalResults/All_Models_Confusion_Matrix.png", dpi=150)
+    plt.close()
+    print("   -> [1] GlobalResults/All_Models_Confusion_Matrix.png généré.")
+
+    # B. Le Heatmap de Résumé (Accuracy)
+    summary_data = []
+    for mod in models_order:
+        row = []
+        for meth in methods_order:
+            if meth in global_results[mod]:
+                row.append(global_results[mod][meth]["acc"])
+            else:
+                row.append(0)
+        summary_data.append(row)
+    
+    df_summary = pd.DataFrame(summary_data, index=models_order, columns=methods_order)
+    
+    plt.figure(figsize=(8, 5))
+    sns.heatmap(df_summary, annot=True, fmt=".1f", cmap="RdYlGn", vmin=40, vmax=90, cbar_kws={'label': 'Accuracy (%)'})
+    plt.title("Synthèse des Performances (Accuracy Global)", fontsize=14)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig("GlobalResults/Accuracy_Summary_Heatmap.png", dpi=150)
+    plt.close()
+    print("   -> [2] GlobalResults/Accuracy_Summary_Heatmap.png généré.")
+
 if __name__ == "__main__":
-    print(f"=====================K = {0} ========================")
-    run_classification("classify_term_type_with_llm", k=0)
-    for k in range(1,11):
-        print(f"\n\n================== K = {k} ==================")
-        run_classification("classify_term_type_with_dynamic_few_shot", k)
+    #print(f"=====================K = {0} ========================")
+    #run_classification("classify_term_type_with_llm", k=0)
+    #for k in range(1,6):
+    #    print(f"\n\n================== K = {k} ==================")
+    #    run_classification("classify_term_type_with_dynamic_few_shot", k)
     #for k in range(1,11):
     #    run_classification("classify_term_type_with_rag", k)
-    #adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
-    #evaluate_finetuned_model("Google-Large", "./ft_google_large", use_rag=False, k=0)
-    #for i in range(1,11):
-    #    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i)
+    #adapter_path = run_finetuning("Qwen", output_dir="./ft_qwen")
+    #evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=False, k=0, batch_size=32)
+    #for i in range(1,6):
+    #    print(f"\n\n================== K = {i} ==================")
+    #    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i, batch_size=32)
     #run_classification("classify_term_type_with_llm", k=0)
 
     #path_ft = "./ft_google_small"
@@ -1677,3 +1885,5 @@ if __name__ == "__main__":
     #run_full_error_analysis_matrix(n_samples=100)
 
     #analyze_dataset_stats()
+
+    run_full_benchmark_and_viz(n_samples=200)

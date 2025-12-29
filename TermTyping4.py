@@ -500,6 +500,16 @@ def run_classification(classification_task, k):
                 embedder, rag_embeddings, rag_corpus["terms"], rag_corpus["labels"], rag_corpus["sentences"], 
                 rag_corpus["id2label"], k
             )
+             
+        elif classification_task == "classify_term_type_with_rag":
+            # On doit récupérer le contexte pour chaque phrase du batch
+            # Note: Vous devrez implémenter une version batched de get_rag_context pour l'efficacité
+            current_batch_contexts = []
+            for sent in batch_sentences:
+                # Appel à votre fonction existante (non-batchée mais fonctionnelle)
+                ctx = get_rag_context(sent, embedder, rag_embeddings, rag_corpus, k)
+                current_batch_contexts.append(ctx)
+            batch_context_text = current_batch_contexts
 
         # Construction Prompts
         prompts = []
@@ -857,26 +867,31 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
         # >>> STRATÉGIE QWEN (SFTTrainer / Causal) <<<
         print(">>> Utilisation de SFTTrainer pour Qwen")
         
+        # 1. On crée la config SANS max_seq_length pour éviter le crash TypeError
         training_args = SFTConfig(
             output_dir=f"{output_dir}_checkpoints",
-            per_device_train_batch_size=4,
+            per_device_train_batch_size=32,
             gradient_accumulation_steps=4,
             learning_rate=2e-4,
             logging_steps=10,
-            num_train_epochs=1,
+            num_train_epochs=3,
             save_strategy="epoch",
             fp16=False,
             bf16=False,
             dataset_text_field="text",
-            max_seq_length=256,
+            group_by_length=True,
             report_to="none",
         )
 
+        # 2. On l'injecte manuellement "de force" (C'est sale mais ça marche à tous les coups)
+        training_args.max_seq_length = 256
+
+        # 3. On initialise le Trainer SANS max_seq_length
         trainer = SFTTrainer(
             model=model,
             train_dataset=train_dataset,
-            args=training_args,
-            processing_class=tokenizer 
+            args=training_args,        # Le trainer lira args.max_seq_length ici
+            processing_class=tokenizer,
         )
 
     # Lancement
@@ -1650,17 +1665,18 @@ def analyze_dataset_stats():
     print("=======================================================\n")
 
 if __name__ == "__main__":
-    print(f"=====================K = {0} ========================")
-    run_classification("classify_term_type_with_llm", k=0)
-    for k in range(1,11):
-        print(f"\n\n================== K = {k} ==================")
-        run_classification("classify_term_type_with_dynamic_few_shot", k)
+    #print(f"=====================K = {0} ========================")
+    #run_classification("classify_term_type_with_llm", k=0)
+    #for k in range(1,6):
+    #    print(f"\n\n================== K = {k} ==================")
+    #    run_classification("classify_term_type_with_dynamic_few_shot", k)
     #for k in range(1,11):
     #    run_classification("classify_term_type_with_rag", k)
-    #adapter_path = run_finetuning("Google-Large", output_dir="./ft_google_large")
-    #evaluate_finetuned_model("Google-Large", "./ft_google_large", use_rag=False, k=0)
-    #for i in range(1,11):
-    #    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i)
+    adapter_path = run_finetuning("Qwen", output_dir="./ft_qwen")
+    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=False, k=0, batch_size=32)
+    for i in range(1,6):
+        print(f"\n\n================== K = {i} ==================")
+        evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i, batch_size=32)
     #run_classification("classify_term_type_with_llm", k=0)
 
     #path_ft = "./ft_google_small"
