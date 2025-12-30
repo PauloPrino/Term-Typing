@@ -31,7 +31,27 @@ from trl import SFTTrainer, SFTConfig
 import trl
 import sys
 import time
-import gc
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from collections import Counter
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+from peft import PeftModel
+from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, GenerationConfig
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, GenerationConfig
+from datasets import load_dataset
+import os
+from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
+from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments
+import time
 
 # --- Force flush output to see logs immediately ---
 sys.stdout.reconfigure(line_buffering=True)
@@ -103,8 +123,6 @@ available_labels = list(id2label.values())
 device = "cuda" if torch.cuda.is_available() else "cpu"
 n_gpus = torch.cuda.device_count()
 print(f"Utilisation de {n_gpus} GPUs !")
-
-from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
 
 def calculate_metrics(y_true, y_pred, model_name="Model"):
     print(f"\n--- 📊 RAPPORT DE PERFORMANCE CORRIGÉ : {model_name} ---")
@@ -304,7 +322,6 @@ elif LLM_MODEL == "Google-Base":
 # --- FONCTIONS DE GÉNÉRATION GLOBALES (Hors des if/elif) ---
 
 def generate_qwen_batched(prompts, llm_model, tokenizer_model, generation_cfg):
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Template Chat pour Qwen
@@ -346,7 +363,6 @@ def generate_qwen_batched(prompts, llm_model, tokenizer_model, generation_cfg):
     return outputs
 
 def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg):
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     inputs = tokenizer_model(prompts, return_tensors="pt", padding=True).to(device)
@@ -364,7 +380,6 @@ def generate_google_batched(prompts, llm_model, tokenizer_model, generation_cfg)
     return outputs
 
 def generate_google_simple(prompt, llm_model, tokenizer_model, generation_cfg):
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     inputs = tokenizer_model(prompt, return_tensors="pt").to(device)
@@ -706,7 +721,6 @@ Answer by only giving the term type and not explaining.
 
 """## Fine tuning"""
 
-from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments
 
 def format_dataset_for_training(terms, sentences, labels_ids, id2label, tokenizer, model_type):
     available_labels = list(id2label.values())
@@ -747,56 +761,80 @@ def format_dataset_for_training(terms, sentences, labels_ids, id2label, tokenize
 def run_finetuning(model_name_key, output_dir="./finetuned_model"):
     print(f"--- Démarrage du Fine-Tuning pour : {model_name_key} ---")
     
-    # Récupération des données Train
+    # 1. Récupération des données Train
     train_id2label, train_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
     
-    # Configuration du modèle
-    bnb_config = None
-    is_seq2seq = False
+    # --- CONFIGURATION SPÉCIFIQUE PAR MODÈLE ---
     
     if model_name_key == "Google-Small":
+        print(">>> OPTIMIZED MODE: Full Fine-Tuning (No LoRA) for T5-Small")
         model_id = "google/flan-t5-small"
         is_seq2seq = True
-        target_modules = ["q", "v"] 
+        use_lora = False  # CHANGE: Full training for small model
+        bnb_config = None # No quantization needed
+        
+        # Hyperparamètres optimisés pour T5-Small
+        learning_rate = 5e-4 
+        batch_size = 32      
+        num_epochs = 10      
+        grad_accum = 1       
+
     elif model_name_key == "Google-Base":
         model_id = "google/flan-t5-base"
         is_seq2seq = True
-        target_modules = ["q", "v"]
+        use_lora = True
+        target_modules = ["q", "v", "k", "o"] # Expanded targets
+        bnb_config = None 
+        learning_rate = 3e-4
+        batch_size = 8
+        num_epochs = 5
+        grad_accum = 4
+
     elif model_name_key == "Google-Large":
         model_id = "google/flan-t5-large"
         is_seq2seq = True
+        use_lora = True
         target_modules = ["q", "v"]
-        # FIX: Disable quantization (None). 
-        # The model is small enough to run in full precision/float16 on P100.
-        bnb_config = None
+        bnb_config = None # Fits in P100 RAM usually without bitsandbytes
+        learning_rate = 3e-4
+        batch_size = 4
+        num_epochs = 3
+        grad_accum = 8
+
     elif model_name_key == "Qwen":
         model_id = "Qwen/Qwen3-4B-Instruct-2507"
         is_seq2seq = False
+        use_lora = True
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        # Qwen needs 4-bit to train on consumer/Colab GPU
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16, 
             bnb_4bit_use_double_quant=False,
         )
-    else:
-        raise ValueError("Modèle inconnu.")
+        learning_rate = 2e-4
+        batch_size = 16 
+        num_epochs = 3
+        grad_accum = 4
 
+    else:
+        raise ValueError(f"Modèle inconnu: {model_name_key}")
+
+    # 2. Chargement Tokenizer & Modèle
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
-    # Chargement du modèle
     if is_seq2seq:
-        model_type_str = "seq2seq"
-        # T5
+        # T5 Models
         model = AutoModelForSeq2SeqLM.from_pretrained(
             model_id, 
-            quantization_config=bnb_config, # Supporte 8bit si activé pour Large
+            quantization_config=bnb_config,
             device_map="auto",
-            torch_dtype=torch.float32 if not bnb_config else torch.float16
+            torch_dtype=torch.float32 if model_name_key == "Google-Small" else torch.float16
         )
+        model_type_str = "seq2seq"
     else:
-        model_type_str = "causal"
-        # Qwen
+        # Causal Models (Qwen)
         tokenizer.pad_token = tokenizer.eos_token
         model = AutoModelForCausalLM.from_pretrained(
             model_id, 
@@ -805,35 +843,35 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
             torch_dtype=torch.float16 
         )
         model.config.use_cache = False
+        model_type_str = "causal"
 
-    # Préparation du Dataset
+    # 3. Préparation du Dataset
     train_dataset = format_dataset_for_training(
         train_terms, train_sentences, train_labels, train_id2label, tokenizer, model_type_str
     )
 
-    # Configuration LoRA
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=target_modules,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="SEQ_2_SEQ_LM" if is_seq2seq else "CAUSAL_LM"
-    )
-    
-    if bnb_config:
-        model = prepare_model_for_kbit_training(model)
-    
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
+    # 4. Configuration LoRA (Si activé)
+    if use_lora:
+        print(f">>> Activation de LoRA (Target: {target_modules})")
+        peft_config = LoraConfig(
+            r=32 if model_name_key == "Google-Base" else 16,
+            lora_alpha=64 if model_name_key == "Google-Base" else 32,
+            target_modules=target_modules,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="SEQ_2_SEQ_LM" if is_seq2seq else "CAUSAL_LM"
+        )
+        if bnb_config:
+            model = prepare_model_for_kbit_training(model)
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    else:
+        print(">>> Pas de LoRA (Full Fine-Tuning actif)")
 
-    # --- BRANCHE : SÉLECTION DU TRAINER ---
-    
+    # 5. Configuration & Lancement du Trainer
     if is_seq2seq:
-        # >>> STRATÉGIE T5 (Seq2SeqTrainer) <<<
-        print(">>> Utilisation de Seq2SeqTrainer pour T5")
+        print(f">>> Trainer: Seq2SeqTrainer (BS={batch_size}, LR={learning_rate})")
         
-        # Data Collator spécial qui gère le padding des inputs ET des labels
         data_collator = DataCollatorForSeq2Seq(
             tokenizer,
             model=model,
@@ -843,14 +881,14 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
         
         training_args = Seq2SeqTrainingArguments(
             output_dir=f"{output_dir}_checkpoints",
-            per_device_train_batch_size=8, # T5-Base tient largement en batch 8
-            gradient_accumulation_steps=2,
-            learning_rate=3e-4, # T5 aime les LR un peu plus élevés
-            num_train_epochs=3, # T5 a souvent besoin de plus d'époques que Qwen
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=learning_rate,
+            num_train_epochs=num_epochs,
             logging_steps=10,
             save_strategy="epoch",
             predict_with_generate=False,
-            fp16=False, 
+            fp16=False, # Stabilize T5 training
             bf16=False,
             report_to="none",
         )
@@ -864,41 +902,46 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
         )
         
     else:
-        # >>> STRATÉGIE QWEN (SFTTrainer / Causal) <<<
-        print(">>> Utilisation de SFTTrainer pour Qwen")
+        # Qwen / Causal
+        print(f">>> Trainer: SFTTrainer (BS={batch_size}, LR={learning_rate})")
         
-        # 1. On crée la config SANS max_seq_length pour éviter le crash TypeError
         training_args = SFTConfig(
             output_dir=f"{output_dir}_checkpoints",
-            per_device_train_batch_size=32,
-            gradient_accumulation_steps=4,
-            learning_rate=2e-4,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=learning_rate,
             logging_steps=10,
-            num_train_epochs=3,
+            num_train_epochs=num_epochs,
             save_strategy="epoch",
-            fp16=False,
+            fp16=True, # Qwen supports fp16 well
             bf16=False,
             dataset_text_field="text",
             group_by_length=True,
             report_to="none",
         )
-
-        # 2. On l'injecte manuellement "de force" (C'est sale mais ça marche à tous les coups)
+        
+        # Inject max_seq_length manually
         training_args.max_seq_length = 256
 
-        # 3. On initialise le Trainer SANS max_seq_length
         trainer = SFTTrainer(
             model=model,
             train_dataset=train_dataset,
-            args=training_args,        # Le trainer lira args.max_seq_length ici
+            args=training_args,
             processing_class=tokenizer,
         )
 
-    # Lancement
+    # 6. Entraînement
     trainer.train()
     
-    print(f"Sauvegarde de l'adaptateur dans {output_dir}...")
-    trainer.model.save_pretrained(output_dir)
+    # 7. Sauvegarde
+    print(f"Sauvegarde du modèle dans {output_dir}...")
+    if use_lora:
+        # Save adapter only
+        trainer.model.save_pretrained(output_dir)
+    else:
+        # Save full model (Google-Small case)
+        trainer.model.save_pretrained(output_dir)
+        
     tokenizer.save_pretrained(output_dir)
     
     # Nettoyage
@@ -909,55 +952,101 @@ def run_finetuning(model_name_key, output_dir="./finetuned_model"):
     
     return output_dir
 
-from transformers import BitsAndBytesConfig # Assurez-vous d'avoir cet import
 
 def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, batch_size=16):
     print(f"\n==================================================================")
     print(f"   ÉVALUATION FINE-TUNED : {model_name_key} (RAG={use_rag}, k={k})")
     print(f"==================================================================")
+
+    # --- 1. DETECTION DE TYPE (LoRA vs Full Model) ---
+    # On vérifie si le dossier contient une config LoRA. 
+    # Sinon, on assume que c'est un modèle complet (Full Fine-Tuning).
+    is_lora = os.path.exists(os.path.join(adapter_path, "adapter_config.json"))
     
-    # 1. Configuration du Modèle Base (Optimisé Mémoire)
-    if model_name_key == "Google-Small":
-        base_model_id = "google/flan-t5-small"
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float32).to("cuda")
+    model = None
+    tokenizer = None
+    gen_config = None
+    gen_func = None
+    
+    print(f"--> Mode de chargement détecté : {'LoRA Adapter' if is_lora else 'Full Model (Direct Loading)'}")
+
+    # --- 2. CHARGEMENT DU MODÈLE ---
+    
+    if not is_lora:
+        # >>> CAS A: FULL FINE-TUNING (Ex: Google-Small optimisé) <<<
+        print(f"--> Chargement du modèle complet depuis {adapter_path}...")
+        
+        # On charge tokenizer et modèle directement depuis le dossier de sauvegarde
+        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+        
+        if "Small" in model_name_key or "Base" in model_name_key:
+             # T5 Small/Base tiennent en float32/float16 sans quantization
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                adapter_path, 
+                device_map="auto",
+                torch_dtype=torch.float32 if "Small" in model_name_key else torch.float16
+            )
+        elif "Qwen" in model_name_key:
+             # Qwen Full Model (rare, mais géré)
+             model = AutoModelForCausalLM.from_pretrained(
+                adapter_path, 
+                device_map="auto", 
+                torch_dtype=torch.float16
+            )
+            
+    else:
+        # >>> CAS B: LORA ADAPTER (Ex: Qwen standard) <<<
+        print(f"--> Chargement de la Base + Adapter LoRA...")
+
+        if model_name_key == "Google-Small":
+            base_model_id = "google/flan-t5-small"
+            tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+            base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float32).to("cuda")
+        
+        elif model_name_key == "Google-Base":
+            base_model_id = "google/flan-t5-base"
+            tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+            base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16).to("cuda")
+            
+        elif model_name_key == "Qwen":
+            base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
+            tokenizer = AutoTokenizer.from_pretrained(base_model_id, padding_side="left")
+            if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+            
+            # Qwen en 4-bit obligatoire pour éviter OOM
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4", 
+                bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=False
+            )
+            base_model = AutoModelForCausalLM.from_pretrained(base_model_id, quantization_config=bnb_config, device_map="auto")
+            
+        elif model_name_key == "Google-Large":
+            base_model_id = "google/flan-t5-large"
+            tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+            base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16, device_map="auto")
+
+        # Fusion LoRA
+        try:
+            model = PeftModel.from_pretrained(base_model, adapter_path)
+        except Exception as e:
+            print(f"ERREUR CRITIQUE: Impossible de charger l'adaptateur LoRA. {e}")
+            return
+            
+    model.eval()
+
+    # --- 3. CONFIGURATION GÉNÉRATION ---
+    if "Google" in model_name_key:
         gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
-        gen_func = generate_google_simple 
-    elif model_name_key == "Google-Base":
-        base_model_id = "google/flan-t5-base"
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16).to("cuda")
-        gen_config = GenerationConfig(max_new_tokens=64, do_sample=False)
-        gen_func = generate_google_batched
-    elif model_name_key == "Qwen":
-        base_model_id = "Qwen/Qwen3-4B-Instruct-2507"
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id, padding_side="left")
-        if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
-        # FIX OOM : Qwen en 4-bit OBLIGATOIRE pour l'inférence avec RAG
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", 
-            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=False
-        )
-        base_model = AutoModelForCausalLM.from_pretrained(base_model_id, quantization_config=bnb_config, device_map="auto")
+        if "Small" in model_name_key:
+            # Wrapper pour Small (pas de batch natif dans votre script original)
+            gen_func = lambda p, m, t, c: [generate_google_simple(x, m, t, c) for x in p]
+        else:
+            gen_func = generate_google_batched
+    elif "Qwen" in model_name_key:
         gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
         gen_func = generate_qwen_batched
-    elif model_name_key == "Google-Large":
-        base_model_id = "google/flan-t5-large"
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_id, torch_dtype=torch.float16, device_map="auto")
-        gen_config = GenerationConfig(max_new_tokens=64)
-        gen_func = generate_google_batched
 
-    # 2. Chargement de l'Adaptateur LoRA
-    print(f"--> Chargement des poids LoRA depuis {adapter_path}...")
-    try:
-        model = PeftModel.from_pretrained(base_model, adapter_path)
-        model.eval()
-    except Exception as e:
-        print(f"ERREUR CRITIQUE: Impossible de charger l'adaptateur. Vérifiez le chemin. ({e})")
-        return
-
-    # 3. Préparation RAG (CPU pour économiser GPU)
+    # --- 4. PRÉPARATION RAG (CPU) ---
     embedder = None
     train_embeddings = None
     if use_rag:
@@ -966,12 +1055,12 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
         t_id2label, t_label2id, train_terms, train_labels, train_sentences = WN_TaskA_TextClf_dataset_builder("train")
         train_embeddings = embedder.encode(train_sentences, convert_to_tensor=True).cpu().numpy()
 
-    # 4. Boucle d'Inférence (Batched)
+    # --- 5. INFÉRENCE (Batched) ---
+    # On récupère les globales (text, sentences, label, id2label) définies plus haut dans le script
     available_labels = list(id2label.values())
     y_true_all = []
     y_pred_all = []
     
-    is_batched_func = "batched" in gen_func.__name__
     all_indices = list(range(len(text))) # text = Test terms globaux
     
     print("--> Démarrage de l'inférence...")
@@ -992,13 +1081,16 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
                 id2label, k
             )
 
-        # B. Construction des Prompts
+        # B. Construction Prompts
         prompts = []
         for idx, (term, sentence) in enumerate(zip(batch_terms, batch_sentences)):
             dynamic_examples = batch_dynamic_examples[idx]
             if dynamic_examples:
                 dynamic_examples = f"\nHere are some similar examples to help you:\n{dynamic_examples}\n"
             
+            # Note: Si on a changé le format de prompt pour le fine-tuning (ex: "classify term: ..."),
+            # il faut adapter le prompt ici aussi pour que ça matche !
+            # Pour l'instant on garde le prompt naturel standard.
             if sentence and len(str(sentence)) > 3:
                 base_prompt = f"Given the term '{term}' in the sentence '{sentence}', what is the type of the term? Choose from: {', '.join(available_labels)}."
             else:
@@ -1008,12 +1100,9 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
 
         # C. Génération
         with torch.no_grad():
-            if is_batched_func:
-                batch_responses = gen_func(prompts, model, tokenizer, gen_config)
-            else:
-                batch_responses = [gen_func(p, model, tokenizer, gen_config) for p in prompts]
+            batch_responses = gen_func(prompts, model, tokenizer, gen_config)
 
-        # D. Parsing des Réponses
+        # D. Parsing
         for response, actual_idx in zip(batch_responses, batch_labels_idx):
             resp_lower = response.lower() if response else ""
             pred = "unknown"
@@ -1024,9 +1113,8 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
                     pred = lbl
                     break
             
-            # Recherche premier mot (fallback)
+            # Fallback premier mot
             if pred == "unknown":
-                # --- FIX CRASH ---
                 split_resp = resp_lower.split()
                 if split_resp:
                     first_word = split_resp[0].strip(".,!:")
@@ -1040,19 +1128,14 @@ def evaluate_finetuned_model(model_name_key, adapter_path, use_rag=False, k=3, b
     
     pbar.close()
 
-    # 5. Calcul des Métriques Finales
+    # --- 6. METRIQUES ---
     calculate_metrics(y_true_all, y_pred_all, model_name=f"{model_name_key} (FT + RAG={use_rag})")
     
-    # 6. Nettoyage Mémoire
-    del model, base_model, embedder
+    # Nettoyage
+    del model, embedder
+    if 'base_model' in locals(): del base_model
     torch.cuda.empty_cache()
     gc.collect()
-
-import time
-import gc
-import torch
-from peft import PeftModel
-from transformers import BitsAndBytesConfig
 
 def benchmark_all_methods(adapter_path, n_samples=10):
     print(f"\n=== BENCHMARK DE VITESSE (Moyenne sur {n_samples} échantillons) ===")
@@ -1221,7 +1304,6 @@ def benchmark_all_methods(adapter_path, n_samples=10):
 
     return results
 
-from collections import Counter
 
 def perform_error_analysis(adapter_path, n_samples=50):
     print(f"\n=======================================================")
@@ -1373,31 +1455,6 @@ def perform_error_analysis(adapter_path, n_samples=50):
     del model, embedder, train_emb
     torch.cuda.empty_cache()
     gc.collect()
-
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
-import numpy as np
-import gc
-import torch
-from peft import PeftModel
-from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, GenerationConfig
-from sentence_transformers import SentenceTransformer
-from datasets import load_dataset
-
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
-import numpy as np
-import gc
-import torch
-from peft import PeftModel
-from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, GenerationConfig
-from sentence_transformers import SentenceTransformer
-from datasets import load_dataset
-import os
 
 def run_full_error_analysis_matrix(n_samples=100):
     print(f"\n=================================================================================")
@@ -1600,10 +1657,7 @@ def run_full_error_analysis_matrix(n_samples=100):
     del embedder, train_emb, wiki_emb
     gc.collect()
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-from collections import Counter
+
 
 def analyze_dataset_stats():
     print(f"\n=======================================================")
@@ -1647,9 +1701,9 @@ def analyze_dataset_stats():
     # Graphique en barres côte à côte
     ax = sns.barplot(data=df_stats, x="Label", y="Percentage", hue="Split", palette="viridis")
     
-    plt.title("Distribution des Classes (Train vs Test)", fontsize=14)
-    plt.ylabel("Pourcentage (%)", fontsize=12)
-    plt.xlabel("Type de Terme", fontsize=12)
+    plt.title("Classes Distributions", fontsize=14)
+    plt.ylabel("Percentage (%)", fontsize=12)
+    plt.xlabel("Terme Type", fontsize=12)
     plt.legend(title="Dataset")
     
     # Ajout des valeurs au-dessus des barres
@@ -1664,6 +1718,222 @@ def analyze_dataset_stats():
     print(f"   [Sauvegardé] -> {filename}")
     print("=======================================================\n")
 
+def run_full_benchmark_and_viz(n_samples=100):
+    print(f"\n=================================================================================")
+    print(f"   BENCHMARK GLOBAL & VISUALISATION COMBINÉE ({n_samples} échantillons)")
+    print(f"   (Filtres: Pas de RAG Wiki, Pas de FT+RAG | Layout: Models=Cols, Methods=Rows)")
+    print(f"=================================================================================")
+
+    if not os.path.exists("GlobalResults"):
+        os.makedirs("GlobalResults")
+
+    # --- 1. CONFIGURATION ---
+    MODELS_CONFIG = {
+        "Qwen": {"path": "./ft_qwen", "type": "causal"},
+        "Google-Small": {"path": "./ft_google_small", "type": "seq2seq"},
+        "Google-Base": {"path": "./ft_google_base", "type": "seq2seq"},
+        # Ajoutez Google-Large si nécessaire
+    }
+    
+    global_results = {m: {} for m in MODELS_CONFIG.keys()}
+    
+    # --- 2. PRÉPARATION DES DONNÉES (CPU) ---
+    print("--> Chargement Data & Embedder...")
+    indices = range(min(n_samples, len(text)))
+    sample_terms = [text[i] for i in indices]
+    sample_sentences = [sentences[i] for i in indices]
+    sample_labels_ids = [label[i] for i in indices]
+    y_true = [id2label[i] for i in sample_labels_ids]
+    
+    labels_list = sorted(list(id2label.values()))
+    matrix_labels = labels_list + ["unknown"]
+
+    # On garde l'embedder uniquement pour RAG Train
+    embedder = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
+    t_id2label, t_label2id, tr_terms, tr_labels, tr_sentences = WN_TaskA_TextClf_dataset_builder("train")
+    train_emb = embedder.encode(tr_sentences, convert_to_tensor=True).cpu().numpy()
+    
+    # NOTE: On ne charge plus WikiData car "RAG Wiki" est exclu
+
+    # --- 3. BOUCLE D'INFÉRENCE ---
+    for model_key, config in MODELS_CONFIG.items():
+        print(f"\n>>> Traitement Modèle : {model_key}")
+        
+        # A. Chargement Modèle Base
+        tokenizer = None; model = None; gen_config = None; gen_func_batched = None
+        
+        try:
+            # 1. Détection Type (LoRA vs Full) pour le chargement correct
+            is_lora_path = os.path.exists(os.path.join(config["path"], "adapter_config.json"))
+            
+            # Setup Base Model
+            if config["type"] == "causal": # Qwen
+                base_id = "Qwen/Qwen3-4B-Instruct-2507"
+                tokenizer = AutoTokenizer.from_pretrained(base_id, padding_side="left")
+                if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+                bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+                model = AutoModelForCausalLM.from_pretrained(base_id, quantization_config=bnb, device_map="auto")
+                gen_config = GenerationConfig(max_new_tokens=64, pad_token_id=tokenizer.eos_token_id)
+                gen_func_batched = generate_qwen_batched
+            else: # T5
+                base_id = f"google/flan-t5-{model_key.split('-')[1].lower()}"
+                tokenizer = AutoTokenizer.from_pretrained(base_id)
+                # T5 Small/Base en float32/16 standard
+                dtype = torch.float32 if "Small" in model_key else torch.float16
+                model = AutoModelForSeq2SeqLM.from_pretrained(base_id, torch_dtype=dtype).to("cuda")
+                gen_config = GenerationConfig(max_new_tokens=64)
+                if "Small" in model_key: gen_func_batched = lambda p, m, t, c: [generate_google_simple(x, m, t, c) for x in p]
+                else: gen_func_batched = generate_google_batched
+
+            def predict_single(p, m, t, c): return gen_func_batched([p], m, t, c)[0]
+
+            # B. Définition des Scénarios (Uniquement ceux demandés)
+            scenarios = {
+                "Zero-Shot": lambda t, s: classify_term_type_with_llm(t, s, available_labels, model, tokenizer, False, predict_single, gen_config),
+                # "RAG Wiki": EXCLU
+                "RAG Train": lambda t, s: classify_term_type_with_dynamic_few_shot(t, s, available_labels, model, tokenizer, predict_single, gen_config, embedder, train_emb, tr_terms, tr_labels, tr_sentences, t_id2label, 3),
+                "Fine-Tuned": None, # Placeholder
+                # "FT + RAG": EXCLU
+            }
+
+            # C. Inférence Base (Avant chargement adaptateur)
+            for name in ["Zero-Shot", "RAG Train"]:
+                print(f"   -> {name}...")
+                y_pred = [scenarios[name](t, s).lower().strip().split()[0].strip(".,!:") for t, s in zip(sample_terms, sample_sentences)]
+                
+                y_pred_clean = [l if l in labels_list else "unknown" for l in y_pred]
+                cm = confusion_matrix(y_true, y_pred_clean, labels=matrix_labels)
+                acc = accuracy_score(y_true, y_pred_clean) * 100
+                
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+                    cm_norm = np.nan_to_num(cm_norm)
+                
+                global_results[model_key][name] = {"cm": cm_norm, "acc": acc}
+
+            # D. Chargement Adaptateur & Inférence Fine-Tuned
+            if os.path.exists(config['path']):
+                print(f"   -> Chargement Fine-Tuning {config['path']}...")
+                
+                if is_lora_path:
+                    # LoRA
+                    model = PeftModel.from_pretrained(model, config['path'])
+                else:
+                    # Full Model (Google Small)
+                    del model
+                    torch.cuda.empty_cache()
+                    dtype = torch.float32 if "Small" in model_key else torch.float16
+                    model = AutoModelForSeq2SeqLM.from_pretrained(config['path'], torch_dtype=dtype, device_map="auto")
+                
+                model.eval()
+                
+                # Ré-définition pour utiliser le modèle chargé
+                scenarios["Fine-Tuned"] = lambda t, s: classify_term_type_with_llm(t, s, available_labels, model, tokenizer, False, predict_single, gen_config)
+
+                print(f"   -> Fine-Tuned...")
+                y_pred = [scenarios["Fine-Tuned"](t, s).lower().strip().split()[0].strip(".,!:") for t, s in zip(sample_terms, sample_sentences)]
+                y_pred_clean = [l if l in labels_list else "unknown" for l in y_pred]
+                cm = confusion_matrix(y_true, y_pred_clean, labels=matrix_labels)
+                acc = accuracy_score(y_true, y_pred_clean) * 100
+                
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+                    cm_norm = np.nan_to_num(cm_norm)
+
+                global_results[model_key]["Fine-Tuned"] = {"cm": cm_norm, "acc": acc}
+            else:
+                print(f"   [!] Pas de modèle Fine-Tuned trouvé pour {model_key}")
+
+        except Exception as e:
+            print(f"ERREUR {model_key}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        del model, tokenizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # --- 4. GÉNÉRATION DES GRAPHIQUES (INVERSÉS) ---
+    print("\n>>> Génération des visualisations globales...")
+    
+    # ORDRE DES AXES :
+    # Rows (Lignes) = Techniques
+    # Columns (Colonnes) = Modèles
+    
+    methods_order = ["Zero-Shot", "RAG Train", "Fine-Tuned"]
+    models_order = list(MODELS_CONFIG.keys())
+    
+    n_rows = len(methods_order)
+    n_cols = len(models_order)
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows), sharex=True, sharey=True)
+    
+    # Sécurisation des dimensions du tableau axes
+    if n_rows == 1 and n_cols == 1: axes = np.array([[axes]])
+    elif n_rows == 1: axes = axes[np.newaxis, :]
+    elif n_cols == 1: axes = axes[:, np.newaxis]
+
+    # Double boucle inversée par rapport à avant : 
+    # i parcourt les méthodes (Lignes), j parcourt les modèles (Colonnes)
+    for i, meth in enumerate(methods_order):
+        for j, mod in enumerate(models_order):
+            ax = axes[i, j]
+            
+            if meth in global_results[mod]:
+                data = global_results[mod][meth]
+                sns.heatmap(data["cm"], annot=True, fmt=".0f", cmap="Blues", 
+                            vmin=0, vmax=100, cbar=False, ax=ax,
+                            xticklabels=matrix_labels, yticklabels=matrix_labels, annot_kws={"size": 8})
+                # Score en vert dans le titre
+                ax.set_title(f"Acc: {data['acc']:.1f}%", fontsize=10, color='darkgreen', fontweight='bold')
+            else:
+                ax.text(0.5, 0.5, "N/A", ha='center', va='center', color='gray')
+                ax.axis('off')
+
+            # Labels des Colonnes (Modèles) - Uniquement sur la première ligne
+            if i == 0: 
+                ax.text(0.5, 1.15, mod, transform=ax.transAxes, ha='center', fontsize=12, fontweight='bold')
+            
+            # Labels des Lignes (Méthodes) - Uniquement sur la première colonne
+            if j == 0: 
+                ax.set_ylabel(f"{meth}\nTrue Label", fontsize=11, fontweight='bold')
+            else: 
+                ax.set_ylabel("")
+            
+            # Labels X (Predicted) - Uniquement sur la dernière ligne
+            if i == n_rows - 1: 
+                ax.set_xlabel("Predicted")
+            else: 
+                ax.set_xlabel("")
+
+    plt.suptitle("Comparaison: Modèles (Cols) vs Techniques (Lignes)", fontsize=16, y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig("GlobalResults/All_Models_Confusion_Matrix_Transposed.png", dpi=150)
+    plt.close()
+    print("   -> [1] Matrice de Confusion (Transposée) générée.")
+
+    # --- HEATMAP RÉSUMÉ (Aussi Inversé : Lignes=Méthodes, Cols=Modèles) ---
+    summary_data = []
+    for meth in methods_order:
+        row = []
+        for mod in models_order:
+            if meth in global_results[mod]:
+                row.append(global_results[mod][meth]["acc"])
+            else:
+                row.append(0)
+        summary_data.append(row)
+    
+    df_summary = pd.DataFrame(summary_data, index=methods_order, columns=models_order)
+    
+    plt.figure(figsize=(8, 5))
+    sns.heatmap(df_summary, annot=True, fmt=".1f", cmap="RdYlGn", vmin=40, vmax=95, cbar_kws={'label': 'Accuracy (%)'})
+    plt.title("Synthèse Accuracy (Lignes=Méthodes, Cols=Modèles)", fontsize=14)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig("GlobalResults/Accuracy_Summary_Heatmap_Transposed.png", dpi=150)
+    plt.close()
+    print("   -> [2] Heatmap Résumé (Transposée) générée.")
+
 if __name__ == "__main__":
     #print(f"=====================K = {0} ========================")
     #run_classification("classify_term_type_with_llm", k=0)
@@ -1672,11 +1942,11 @@ if __name__ == "__main__":
     #    run_classification("classify_term_type_with_dynamic_few_shot", k)
     #for k in range(1,11):
     #    run_classification("classify_term_type_with_rag", k)
-    adapter_path = run_finetuning("Qwen", output_dir="./ft_qwen")
-    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=False, k=0, batch_size=32)
-    for i in range(1,6):
-        print(f"\n\n================== K = {i} ==================")
-        evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i, batch_size=32)
+    #adapter_path = run_finetuning("Qwen", output_dir="./ft_qwen")
+    #evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=False, k=0, batch_size=32)
+    #for i in range(1,6):
+    #    print(f"\n\n================== K = {i} ==================")
+    #    evaluate_finetuned_model("Qwen", "./ft_qwen", use_rag=True, k=i, batch_size=32)
     #run_classification("classify_term_type_with_llm", k=0)
 
     #path_ft = "./ft_google_small"
@@ -1693,3 +1963,5 @@ if __name__ == "__main__":
     #run_full_error_analysis_matrix(n_samples=100)
 
     #analyze_dataset_stats()
+
+    run_full_benchmark_and_viz(n_samples=200)
